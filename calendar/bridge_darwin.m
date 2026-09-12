@@ -2,12 +2,9 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <CoreLocation/CoreLocation.h>
-#import <objc/message.h>
 #include "bridge_darwin.h"
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 void ek_cal_free(char* ptr) {
     if (ptr) free(ptr);
@@ -33,43 +30,6 @@ static dispatch_queue_t get_write_queue(void) {
         q = dispatch_queue_create("dev.sidv.eventkit.cal.writes", DISPATCH_QUEUE_SERIAL);
     });
     return q;
-}
-
-// --- Change notifications (self-pipe) ---
-
-static int ek_watch_pipe[2] = {-1, -1};
-static id ek_store_observer = nil;
-
-int ek_cal_watch_start(void) {
-    if (ek_watch_pipe[0] != -1) return 1;
-    if (pipe(ek_watch_pipe) != 0) return 0;
-    fcntl(ek_watch_pipe[0], F_SETFD, FD_CLOEXEC);
-    fcntl(ek_watch_pipe[1], F_SETFD, FD_CLOEXEC);
-
-    EKEventStore *store = get_store();
-    ek_store_observer = [[NSNotificationCenter defaultCenter]
-        addObserverForName:EKEventStoreChangedNotification
-                    object:store
-                     queue:nil
-                usingBlock:^(NSNotification *note) {
-                    char b = 1;
-                    write(ek_watch_pipe[1], &b, 1);
-                }];
-    return 1;
-}
-
-int ek_cal_watch_read_fd(void) { return ek_watch_pipe[0]; }
-
-void ek_cal_watch_stop(void) {
-    if (ek_store_observer) {
-        [[NSNotificationCenter defaultCenter] removeObserver:ek_store_observer];
-        ek_store_observer = nil;
-    }
-    if (ek_watch_pipe[0] != -1) {
-        close(ek_watch_pipe[0]);
-        close(ek_watch_pipe[1]);
-        ek_watch_pipe[0] = ek_watch_pipe[1] = -1;
-    }
 }
 
 // --- Date formatting ---
@@ -121,144 +81,6 @@ static char* to_json(id obj) {
     return strdup([str UTF8String]);
 }
 
-// --- Conference URL (private EventKit API) ---
-//
-// Calendar.app surfaces a "join" link for events whose notes/location/url
-// contain a video-conference link, or whose server payload carries a virtual
-// conference. That value is exposed on EKEvent through private accessors
-// (-conferenceURLForDisplay, -conferenceURL), not through any public API.
-//
-// Reads are guarded by respondsToSelector: and isKindOfClass: so they degrade
-// to nil if Apple removes the accessors in a future macOS release. The Go
-// layer then falls back to its own pure-Go link detection over the public
-// url/location/notes fields.
-
-static NSString* conference_url_for_event(EKEvent* e) {
-    if (!e) return nil;
-    NSArray<NSString*>* selectorNames = @[ @"conferenceURLForDisplay", @"conferenceURL" ];
-    for (NSString* name in selectorNames) {
-        SEL sel = NSSelectorFromString(name);
-        if (![e respondsToSelector:sel]) continue;
-        id v = nil;
-        @try {
-            v = ((id(*)(id, SEL))objc_msgSend)(e, sel);
-        } @catch (NSException* ex) {
-            continue;
-        }
-        if ([v isKindOfClass:[NSURL class]]) {
-            NSString* s = [(NSURL*)v absoluteString];
-            if (s.length > 0) return s;
-        } else if ([v isKindOfClass:[NSString class]] && [(NSString*)v length] > 0) {
-            return (NSString*)v;
-        }
-    }
-    return nil;
-}
-
-int ek_cal_conference_selectors_available(void) {
-    return ([EKEvent instancesRespondToSelector:NSSelectorFromString(@"conferenceURLForDisplay")] ||
-            [EKEvent instancesRespondToSelector:NSSelectorFromString(@"conferenceURL")]) ? 1 : 0;
-}
-
-// --- Attendees (private EventKit write path) ---
-//
-// EventKit has no public API to add attendees. EKAttendee exposes the private
-// factory +attendeeWithName:emailAddress: and EKCalendarItem the private
-// -addAttendee:. Calendar.app also primes new invitations with
-// -addOrganizerAndSelfAttendeeForNewInvitation so the organizer/self attendee
-// exist before invitees are added. All calls are guarded; if any selector is
-// missing the helper reports failure and the caller surfaces ErrUnsupported.
-
-int ek_cal_attendee_selectors_available(void) {
-    Class attendeeClass = objc_getClass("EKAttendee");
-    BOOL factory = attendeeClass &&
-        [attendeeClass respondsToSelector:NSSelectorFromString(@"attendeeWithName:emailAddress:")];
-    BOOL add = [EKEvent instancesRespondToSelector:NSSelectorFromString(@"addAttendee:")];
-    return (factory && add) ? 1 : 0;
-}
-
-// add_attendees_to_event attaches the given attendee dicts ({name,email}) to
-// the event via private API. Returns YES on success (including an empty list),
-// NO if the private API is unavailable or any attendee could not be built.
-static BOOL add_attendees_to_event(EKEvent* event, NSArray* attendees) {
-    if (!attendees || attendees.count == 0) return YES;
-    if (!ek_cal_attendee_selectors_available()) return NO;
-
-    Class attendeeClass = objc_getClass("EKAttendee");
-    SEL factorySel = NSSelectorFromString(@"attendeeWithName:emailAddress:");
-    SEL addSel = NSSelectorFromString(@"addAttendee:");
-
-    // Prime organizer + self attendee the way Calendar.app does, when possible.
-    SEL primeSel = NSSelectorFromString(@"addOrganizerAndSelfAttendeeForNewInvitation");
-    if ([event respondsToSelector:primeSel]) {
-        @try {
-            ((void(*)(id, SEL))objc_msgSend)(event, primeSel);
-        } @catch (NSException* ex) {
-            // Non-fatal — some accounts don't require/allow priming.
-        }
-    }
-
-    for (NSDictionary* a in attendees) {
-        NSString* email = a[@"email"];
-        if (![email isKindOfClass:[NSString class]] || email.length == 0) return NO;
-        NSString* name = [a[@"name"] isKindOfClass:[NSString class]] ? a[@"name"] : email;
-        id attendee = nil;
-        @try {
-            attendee = ((id(*)(id, SEL, id, id))objc_msgSend)(attendeeClass, factorySel, name, email);
-        } @catch (NSException* ex) {
-            return NO;
-        }
-        if (!attendee) return NO;
-        @try {
-            ((void(*)(id, SEL, id))objc_msgSend)(event, addSel, attendee);
-        } @catch (NSException* ex) {
-            return NO;
-        }
-    }
-    return YES;
-}
-
-// --- Travel time ---
-
-static double travel_time_for_event(EKEvent* e) {
-    SEL sel = NSSelectorFromString(@"travelTime");
-    if (![e respondsToSelector:sel]) return 0;
-    @try {
-        return ((double(*)(id, SEL))objc_msgSend)(e, sel);
-    } @catch (NSException* ex) {
-        return 0;
-    }
-}
-
-static void set_travel_time_for_event(EKEvent* e, double seconds) {
-    SEL sel = NSSelectorFromString(@"setTravelTime:");
-    if (![e respondsToSelector:sel]) return;
-    @try {
-        ((void(*)(id, SEL, double))objc_msgSend)(e, sel, seconds);
-    } @catch (NSException* ex) {
-    }
-}
-
-// --- Self participant status (RSVP read) ---
-
-static NSInteger self_participant_status(EKEvent* e) {
-    SEL sel = NSSelectorFromString(@"selfParticipantStatus");
-    if (![e respondsToSelector:sel]) {
-        // Fall back to the public selfAttendee.participantStatus.
-        if (e.attendees) {
-            for (EKParticipant* p in e.attendees) {
-                if (p.isCurrentUser) return p.participantStatus;
-            }
-        }
-        return EKParticipantStatusUnknown;
-    }
-    @try {
-        return ((NSInteger(*)(id, SEL))objc_msgSend)(e, sel);
-    } @catch (NSException* ex) {
-        return EKParticipantStatusUnknown;
-    }
-}
-
 // --- Event to dictionary conversion ---
 
 static NSDictionary* event_to_dict(EKEvent* e) {
@@ -271,9 +93,6 @@ static NSDictionary* event_to_dict(EKEvent* e) {
     d[@"location"] = e.location ?: [NSNull null];
     d[@"notes"] = e.notes ?: [NSNull null];
     d[@"url"] = e.URL ? [e.URL absoluteString] : [NSNull null];
-    d[@"conferenceURL"] = conference_url_for_event(e) ?: [NSNull null];
-    d[@"travelTime"] = @(travel_time_for_event(e));
-    d[@"selfStatus"] = @(self_participant_status(e));
     d[@"calendar"] = e.calendar.title ?: @"";
     d[@"calendarID"] = e.calendar.calendarIdentifier ?: @"";
     d[@"status"] = @(e.status);
@@ -442,6 +261,7 @@ static NSDictionary* calendar_to_dict(EKCalendar* cal) {
     d[@"title"] = cal.title ?: @"";
     d[@"type"] = @(cal.type);
     d[@"source"] = cal.source.title ?: @"";
+    d[@"sourceID"] = cal.source.sourceIdentifier ?: @"";
     d[@"readOnly"] = cal.allowsContentModifications ? @NO : @YES;
 
     // Color as hex string.
@@ -465,13 +285,14 @@ static NSDictionary* calendar_to_dict(EKCalendar* cal) {
 // --- Find calendar by name (case-insensitive) ---
 
 static EKCalendar* find_calendar_by_name(EKEventStore* store, NSString* name) {
-    NSString* lowerName = [name lowercaseString];
+    EKCalendar* match = nil;
     for (EKCalendar* cal in [store calendarsForEntityType:EKEntityTypeEvent]) {
-        if ([[cal.title lowercaseString] isEqualToString:lowerName]) {
-            return cal;
+        if ([cal.title caseInsensitiveCompare:name] == NSOrderedSame) {
+            if (match) return nil;
+            match = cal;
         }
     }
-    return nil;
+    return match;
 }
 
 // --- Find calendar by ID ---
@@ -497,7 +318,7 @@ static NSString* available_calendar_names(EKEventStore* store) {
 
 // --- Public API ---
 
-ek_result_t ek_cal_request_access(void) {
+static ek_result_t impl_ek_cal_request_access(void) {
     @autoreleasepool {
         ek_result_t res = {NULL, NULL};
         EKEventStore* store = get_store();
@@ -522,7 +343,10 @@ ek_result_t ek_cal_request_access(void) {
             }];
 #pragma clang diagnostic pop
         }
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 60LL*NSEC_PER_SEC)) != 0) {
+            res.error = strdup("authorization timed out; check macOS privacy permissions");
+            return res;
+        }
 
         if (!granted) {
             if (accessError) {
@@ -538,7 +362,7 @@ ek_result_t ek_cal_request_access(void) {
     }
 }
 
-ek_result_t ek_cal_fetch_calendars(void) {
+static ek_result_t impl_ek_cal_fetch_calendars(void) {
     @autoreleasepool {
         ek_result_t res = {NULL, NULL};
         EKEventStore* store = get_store();
@@ -555,8 +379,8 @@ ek_result_t ek_cal_fetch_calendars(void) {
     }
 }
 
-ek_result_t ek_cal_fetch_events(const char* start_date, const char* end_date,
-                           const char* calendar_id, const char* search_query) {
+static ek_result_t impl_ek_cal_fetch_events(const char* start_date, const char* end_date,
+                           const char* calendar_id, const char* search_query, int strict_id) {
     @autoreleasepool {
         ek_result_t res = {NULL, NULL};
         EKEventStore* store = get_store();
@@ -579,14 +403,11 @@ ek_result_t ek_cal_fetch_events(const char* start_date, const char* end_date,
             for (NSString* part in parts) {
                 NSString* trimmed = [part stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
                 if (trimmed.length == 0) continue;
-                EKCalendar* cal = find_calendar_by_id(store, trimmed);
-                if (!cal) {
-                    cal = find_calendar_by_name(store, trimmed);
-                }
+                EKCalendar* cal = strict_id ? find_calendar_by_id(store, trimmed) : find_calendar_by_name(store, trimmed);
                 if (cal) {
                     [matched addObject:cal];
                 } else {
-                    res.error = strdup([[NSString stringWithFormat:@"calendar not found: %@ (available: %@)", trimmed, available_calendar_names(store)] UTF8String]);
+                    res.error = strdup([[NSString stringWithFormat:@"calendar not found or ambiguous: %@ (available: %@)", trimmed, available_calendar_names(store)] UTF8String]);
                     return res;
                 }
             }
@@ -629,7 +450,7 @@ ek_result_t ek_cal_fetch_events(const char* start_date, const char* end_date,
     }
 }
 
-ek_result_t ek_cal_get_event(const char* event_id) {
+static ek_result_t impl_ek_cal_get_event(const char* event_id) {
     @autoreleasepool {
         ek_result_t res = {NULL, NULL};
         if (!event_id) {
@@ -648,32 +469,15 @@ ek_result_t ek_cal_get_event(const char* event_id) {
             return res;
         }
 
-        // Prefix match: search events in a broad range and match by prefix.
-        NSString* upperTarget = [eid uppercaseString];
-        NSDate* start = [NSDate dateWithTimeIntervalSinceNow:-365 * 24 * 60 * 60]; // 1 year ago
-        NSDate* end = [NSDate dateWithTimeIntervalSinceNow:365 * 24 * 60 * 60];    // 1 year from now
-        NSPredicate* predicate = [store predicateForEventsWithStartDate:start
-                                                               endDate:end
-                                                             calendars:nil];
-        NSArray<EKEvent*>* events = [store eventsMatchingPredicate:predicate];
-
-        for (EKEvent* e in events) {
-            NSString* eId = [e.eventIdentifier uppercaseString];
-            if ([eId hasPrefix:upperTarget]) {
-                res.result = to_json(event_to_dict(e));
-                if (!res.result) res.error = strdup("JSON serialization failed");
-                return res;
-            }
-        }
-
         res.error = strdup([[NSString stringWithFormat:@"event not found: %s", event_id] UTF8String]);
         return res;
     }
 }
 
-ek_result_t ek_cal_create_event(const char* json_input) {
+static ek_result_t impl_ek_cal_create_event(const char* json_input) {
     __block ek_result_t res = {NULL, NULL};
     dispatch_sync(get_write_queue(), ^{
+        @try {
         @autoreleasepool {
             if (!json_input) {
                 res.error = strdup([@"JSON input is required" UTF8String]);
@@ -728,11 +532,11 @@ ek_result_t ek_cal_create_event(const char* json_input) {
             }
 
             // Calendar.
-            if (input[@"calendar"] && input[@"calendar"] != [NSNull null]) {
+            if (input[@"calendarID"] || (input[@"calendar"] && input[@"calendar"] != [NSNull null])) {
                 NSString* calName = input[@"calendar"];
-                EKCalendar* cal = find_calendar_by_name(store, calName);
+                EKCalendar* cal = input[@"calendarID"] ? find_calendar_by_id(store, input[@"calendarID"]) : find_calendar_by_name(store, calName);
                 if (!cal) {
-                    res.error = strdup([[NSString stringWithFormat:@"calendar not found: %@ (available: %@)", calName, available_calendar_names(store)] UTF8String]);
+                    res.error = strdup([[NSString stringWithFormat:@"calendar not found or ambiguous: %@ (available: %@)", calName, available_calendar_names(store)] UTF8String]);
                     return;
                 }
                 event.calendar = cal;
@@ -846,21 +650,6 @@ ek_result_t ek_cal_create_event(const char* json_input) {
                 event.structuredLocation = loc;
             }
 
-            // Travel time (private API; no-op if unavailable).
-            if (input[@"travelTime"] && input[@"travelTime"] != [NSNull null]) {
-                set_travel_time_for_event(event, [input[@"travelTime"] doubleValue]);
-            }
-
-            // Attendees (private API). Fail loudly if requested but unsupported
-            // so the caller doesn't silently save an event without invitees.
-            if (input[@"attendees"] && input[@"attendees"] != [NSNull null]) {
-                NSArray* attendees = input[@"attendees"];
-                if (attendees.count > 0 && !add_attendees_to_event(event, attendees)) {
-                    res.error = strdup([@"attendees are not supported on this macOS or could not be added" UTF8String]);
-                    return;
-                }
-            }
-
             // Save.
             NSError* saveError = nil;
             BOOL saved = [store saveEvent:event span:EKSpanThisEvent commit:YES error:&saveError];
@@ -873,13 +662,20 @@ ek_result_t ek_cal_create_event(const char* json_input) {
             res.result = to_json(event_to_dict(event));
             if (!res.result) res.error = strdup("JSON serialization failed");
         }
+        } @catch (NSException* exception) {
+            [get_store() reset];
+            if (res.result) { free(res.result); res.result = NULL; }
+            if (res.error) free(res.error);
+            res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        }
     });
     return res;
 }
 
-ek_result_t ek_cal_update_event(const char* event_id, const char* json_input, int span) {
+static ek_result_t impl_ek_cal_update_event(const char* event_id, const char* json_input, int span) {
     __block ek_result_t res = {NULL, NULL};
     dispatch_sync(get_write_queue(), ^{
+        @try {
         @autoreleasepool {
             if (!event_id || !json_input) {
                 res.error = strdup([@"event ID and JSON input are required" UTF8String]);
@@ -904,6 +700,11 @@ ek_result_t ek_cal_update_event(const char* event_id, const char* json_input, in
                 return;
             }
 
+            NSDate* proposedStart = input[@"startDate"] ? parse_iso_date([input[@"startDate"] UTF8String]) : event.startDate;
+            NSDate* proposedEnd = input[@"endDate"] ? parse_iso_date([input[@"endDate"] UTF8String]) : event.endDate;
+            if (!proposedStart || !proposedEnd || [proposedEnd compare:proposedStart] != NSOrderedDescending) {
+                res.error = strdup("end must be after start"); return;
+            }
             // Update fields that are present in input.
             if (input[@"title"] && input[@"title"] != [NSNull null]) {
                 event.title = input[@"title"];
@@ -947,18 +748,18 @@ ek_result_t ek_cal_update_event(const char* event_id, const char* json_input, in
                     event.timeZone = nil;
                 } else {
                     NSTimeZone* tz = [NSTimeZone timeZoneWithName:input[@"timeZone"]];
-                    if (tz) {
+                    if (tz || [input[@"timeZone"] length] == 0) {
                         event.timeZone = tz;
                     }
                 }
             }
 
             // Calendar (move to different calendar).
-            if (input[@"calendar"] && input[@"calendar"] != [NSNull null]) {
+            if (input[@"calendarID"] || (input[@"calendar"] && input[@"calendar"] != [NSNull null])) {
                 NSString* calName = input[@"calendar"];
-                EKCalendar* cal = find_calendar_by_name(store, calName);
+                EKCalendar* cal = input[@"calendarID"] ? find_calendar_by_id(store, input[@"calendarID"]) : find_calendar_by_name(store, calName);
                 if (!cal) {
-                    res.error = strdup([[NSString stringWithFormat:@"calendar not found: %@ (available: %@)", calName, available_calendar_names(store)] UTF8String]);
+                    res.error = strdup([[NSString stringWithFormat:@"calendar not found or ambiguous: %@ (available: %@)", calName, available_calendar_names(store)] UTF8String]);
                     return;
                 }
                 event.calendar = cal;
@@ -1069,20 +870,6 @@ ek_result_t ek_cal_update_event(const char* event_id, const char* json_input, in
                 }
             }
 
-            // Travel time (private API; no-op if unavailable).
-            if (input[@"travelTime"] != nil && input[@"travelTime"] != [NSNull null]) {
-                set_travel_time_for_event(event, [input[@"travelTime"] doubleValue]);
-            }
-
-            // Attendees (private API). Adds to the existing attendee list.
-            if (input[@"attendees"] != nil && input[@"attendees"] != [NSNull null]) {
-                NSArray* attendees = input[@"attendees"];
-                if (attendees.count > 0 && !add_attendees_to_event(event, attendees)) {
-                    res.error = strdup([@"attendees are not supported on this macOS or could not be added" UTF8String]);
-                    return;
-                }
-            }
-
             // Save.
             EKSpan ekSpan = (span == 1) ? EKSpanFutureEvents : EKSpanThisEvent;
             NSError* saveError = nil;
@@ -1095,6 +882,12 @@ ek_result_t ek_cal_update_event(const char* event_id, const char* json_input, in
 
             res.result = to_json(event_to_dict(event));
             if (!res.result) res.error = strdup("JSON serialization failed");
+        }
+        } @catch (NSException* exception) {
+            [get_store() reset];
+            if (res.result) { free(res.result); res.result = NULL; }
+            if (res.error) free(res.error);
+            res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
         }
     });
     return res;
@@ -1115,23 +908,18 @@ static NSString* available_source_names(EKEventStore* store, EKEntityType entity
 
 // --- Find source by name (case-insensitive) ---
 
-static EKSource* find_source_by_name(EKEventStore* store, NSString* name) {
-    NSString* lowerName = [name lowercaseString];
-    // Multiple sources can share the same title (e.g., "iCloud" for events
-    // and "iCloud" for reminders). Prefer the one that has event calendars.
-    EKSource* fallback = nil;
+static EKSource* find_source(EKEventStore* store, NSString* name, NSString* sourceID) {
+    EKSource* match = nil;
     for (EKSource* source in store.sources) {
-        if ([[source.title lowercaseString] isEqualToString:lowerName]) {
-            NSSet* eventCals = [source calendarsForEntityType:EKEntityTypeEvent];
-            if (eventCals.count > 0) {
-                return source;
-            }
-            if (!fallback) {
-                fallback = source;
-            }
+        if (sourceID) {
+            if ([source.sourceIdentifier isEqualToString:sourceID]) return source;
+        } else if ([source.title caseInsensitiveCompare:name] == NSOrderedSame &&
+                   [source calendarsForEntityType:EKEntityTypeEvent].count > 0) {
+            if (match) return nil;
+            match = source;
         }
     }
-    return fallback;
+    return match;
 }
 
 // --- Parse hex color string to CGColorRef ---
@@ -1159,9 +947,10 @@ static CGColorRef parse_hex_color(NSString* hex) {
 
 // --- Calendar CRUD ---
 
-ek_result_t ek_cal_create_calendar(const char* json_input) {
+static ek_result_t impl_ek_cal_create_calendar(const char* json_input) {
     __block ek_result_t res = {NULL, NULL};
     dispatch_sync(get_write_queue(), ^{
+        @try {
         @autoreleasepool {
             if (!json_input) {
                 res.error = strdup([@"JSON input is required" UTF8String]);
@@ -1185,9 +974,9 @@ ek_result_t ek_cal_create_calendar(const char* json_input) {
             cal.title = input[@"title"] ?: @"";
 
             // Source (required — validated in Go layer).
-            EKSource* source = find_source_by_name(store, input[@"source"]);
+            EKSource* source = find_source(store, input[@"source"], input[@"sourceID"]);
             if (!source) {
-                res.error = strdup([[NSString stringWithFormat:@"source not found: %@ (available: %@)", input[@"source"], available_source_names(store, EKEntityTypeEvent)] UTF8String]);
+                res.error = strdup([[NSString stringWithFormat:@"source not found or ambiguous: %@ (available: %@)", input[@"source"], available_source_names(store, EKEntityTypeEvent)] UTF8String]);
                 return;
             }
             cal.source = source;
@@ -1213,13 +1002,20 @@ ek_result_t ek_cal_create_calendar(const char* json_input) {
             res.result = to_json(calendar_to_dict(cal));
             if (!res.result) res.error = strdup("JSON serialization failed");
         }
+        } @catch (NSException* exception) {
+            [get_store() reset];
+            if (res.result) { free(res.result); res.result = NULL; }
+            if (res.error) free(res.error);
+            res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        }
     });
     return res;
 }
 
-ek_result_t ek_cal_update_calendar(const char* calendar_id, const char* json_input) {
+static ek_result_t impl_ek_cal_update_calendar(const char* calendar_id, const char* json_input) {
     __block ek_result_t res = {NULL, NULL};
     dispatch_sync(get_write_queue(), ^{
+        @try {
         @autoreleasepool {
             if (!calendar_id || !json_input) {
                 res.error = strdup([@"calendar ID and JSON input are required" UTF8String]);
@@ -1276,13 +1072,20 @@ ek_result_t ek_cal_update_calendar(const char* calendar_id, const char* json_inp
             res.result = to_json(calendar_to_dict(cal));
             if (!res.result) res.error = strdup("JSON serialization failed");
         }
+        } @catch (NSException* exception) {
+            [get_store() reset];
+            if (res.result) { free(res.result); res.result = NULL; }
+            if (res.error) free(res.error);
+            res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        }
     });
     return res;
 }
 
-ek_result_t ek_cal_delete_calendar(const char* calendar_id) {
+static ek_result_t impl_ek_cal_delete_calendar(const char* calendar_id) {
     __block ek_result_t res = {NULL, NULL};
     dispatch_sync(get_write_queue(), ^{
+        @try {
         @autoreleasepool {
             if (!calendar_id) {
                 res.error = strdup([@"calendar ID is required" UTF8String]);
@@ -1314,52 +1117,20 @@ ek_result_t ek_cal_delete_calendar(const char* calendar_id) {
 
             res.result = strdup("ok");
         }
-    });
-    return res;
-}
-
-ek_result_t ek_cal_delete_events(const char* json_ids, int span) {
-    __block ek_result_t res = {NULL, NULL};
-    dispatch_sync(get_write_queue(), ^{
-        @autoreleasepool {
-            if (!json_ids) {
-                res.error = strdup([@"JSON input is required" UTF8String]);
-                return;
-            }
-
-            NSData* data = [NSData dataWithBytes:json_ids length:strlen(json_ids)];
-            NSError* parseError = nil;
-            NSArray* ids = [NSJSONSerialization JSONObjectWithData:data options:0 error:&parseError];
-            if (!ids) {
-                res.error = strdup([[NSString stringWithFormat:@"invalid JSON: %@", parseError.localizedDescription] UTF8String]);
-                return;
-            }
-
-            EKEventStore* store = get_store();
-            EKSpan ekSpan = (span == 1) ? EKSpanFutureEvents : EKSpanThisEvent;
-            NSMutableDictionary* errors = [NSMutableDictionary dictionary];
-
-            for (NSString* eid in ids) {
-                EKEvent* event = [store eventWithIdentifier:eid];
-                if (!event) continue; // silently skip not found
-
-                NSError* removeError = nil;
-                BOOL removed = [store removeEvent:event span:ekSpan commit:YES error:&removeError];
-                if (!removed) {
-                    errors[eid] = [removeError localizedDescription] ?: @"unknown error";
-                }
-            }
-
-            res.result = to_json(errors);
-            if (!res.result) res.error = strdup("JSON serialization failed");
+        } @catch (NSException* exception) {
+            [get_store() reset];
+            if (res.result) { free(res.result); res.result = NULL; }
+            if (res.error) free(res.error);
+            res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
         }
     });
     return res;
 }
 
-ek_result_t ek_cal_delete_event(const char* event_id, int span) {
+static ek_result_t impl_ek_cal_delete_event(const char* event_id, int span) {
     __block ek_result_t res = {NULL, NULL};
     dispatch_sync(get_write_queue(), ^{
+        @try {
         @autoreleasepool {
             if (!event_id) {
                 res.error = strdup([@"event ID is required" UTF8String]);
@@ -1386,272 +1157,105 @@ ek_result_t ek_cal_delete_event(const char* event_id, int span) {
 
             res.result = strdup("ok");
         }
-    });
-    return res;
-}
-
-// --- RSVP: respond to an invitation ---
-
-int ek_cal_rsvp_selectors_available(void) {
-    return ([EKEvent instancesRespondToSelector:NSSelectorFromString(@"setAttendeeStatus:")] ||
-            [EKEvent instancesRespondToSelector:NSSelectorFromString(@"selfParticipantStatus")]) ? 1 : 0;
-}
-
-// ek_cal_respond_to_event sets the current user's participation status on an
-// event invitation. status uses EKParticipantStatus values (2=accepted,
-// 3=declined, 4=tentative). Returns "ok" on success.
-ek_result_t ek_cal_respond_to_event(const char* event_id, int status) {
-    __block ek_result_t res = {NULL, NULL};
-    dispatch_sync(get_write_queue(), ^{
-        @autoreleasepool {
-            if (!event_id) {
-                res.error = strdup([@"event ID is required" UTF8String]);
-                return;
-            }
-            EKEventStore* store = get_store();
-            EKEvent* event = [store eventWithIdentifier:[NSString stringWithUTF8String:event_id]];
-            if (!event) {
-                res.error = strdup([[NSString stringWithFormat:@"event not found: %s", event_id] UTF8String]);
-                return;
-            }
-
-            // Prefer -setAttendeeStatus: (updates self attendee + flags the
-            // event for a reply to the organizer on save). Fall back to setting
-            // the self attendee's participant status directly.
-            SEL setStatusSel = NSSelectorFromString(@"setAttendeeStatus:");
-            BOOL applied = NO;
-            if ([event respondsToSelector:setStatusSel]) {
-                @try {
-                    ((void(*)(id, SEL, NSInteger))objc_msgSend)(event, setStatusSel, (NSInteger)status);
-                    applied = YES;
-                } @catch (NSException* ex) {
-                    applied = NO;
-                }
-            }
-            if (!applied) {
-                SEL selfSel = NSSelectorFromString(@"selfAttendee");
-                if ([event respondsToSelector:selfSel]) {
-                    id self_att = ((id(*)(id, SEL))objc_msgSend)(event, selfSel);
-                    SEL setPartSel = NSSelectorFromString(@"setParticipantStatus:");
-                    if (self_att && [self_att respondsToSelector:setPartSel]) {
-                        @try {
-                            ((void(*)(id, SEL, NSInteger))objc_msgSend)(self_att, setPartSel, (NSInteger)status);
-                            applied = YES;
-                        } @catch (NSException* ex) {
-                            applied = NO;
-                        }
-                    }
-                }
-            }
-            if (!applied) {
-                res.error = strdup([@"RSVP is not supported on this macOS or this event cannot be responded to" UTF8String]);
-                return;
-            }
-
-            NSError* saveError = nil;
-            BOOL saved = [store saveEvent:event span:EKSpanThisEvent commit:YES error:&saveError];
-            if (!saved) {
-                res.error = strdup([[NSString stringWithFormat:@"failed to save RSVP: %@",
-                    saveError.localizedDescription] UTF8String]);
-                return;
-            }
-            res.result = strdup("ok");
+        } @catch (NSException* exception) {
+            [get_store() reset];
+            if (res.result) { free(res.result); res.result = NULL; }
+            if (res.error) free(res.error);
+            res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
         }
     });
     return res;
 }
 
-// --- Free/busy availability ---
 
-int ek_cal_availability_selectors_available(void) {
-    Class opClass = objc_getClass("EKRequestAvailabilityOperation");
-    return opClass ? 1 : 0;
-}
-
-// ek_cal_request_availability looks up free/busy spans for the given addresses
-// between start and end. Returns a JSON object mapping each address to an array
-// of {startDate,endDate,type} spans (type: 0=free,1=busy,2=tentative,
-// 3=unavailable). Only sources whose backing server supports availability
-// requests are queried (iCloud, for instance, does not). Addresses with no
-// data are returned with an empty array.
-ek_result_t ek_cal_request_availability(const char* start_date, const char* end_date, const char* json_addresses) {
-    ek_result_t res = {NULL, NULL};
-    @autoreleasepool {
-        if (!start_date || !end_date || !json_addresses) {
-            res.error = strdup([@"start, end, and addresses are required" UTF8String]);
-            return res;
-        }
-        if (!ek_cal_availability_selectors_available()) {
-            res.error = strdup([@"availability lookup is not supported on this macOS" UTF8String]);
-            return res;
-        }
-        NSDate* start = parse_iso_date(start_date);
-        NSDate* end = parse_iso_date(end_date);
-        if (!start || !end) {
-            res.error = strdup([@"invalid start or end date" UTF8String]);
-            return res;
-        }
-        NSData* addrData = [NSData dataWithBytes:json_addresses length:strlen(json_addresses)];
-        NSError* parseErr = nil;
-        NSArray* addresses = [NSJSONSerialization JSONObjectWithData:addrData options:0 error:&parseErr];
-        if (![addresses isKindOfClass:[NSArray class]] || addresses.count == 0) {
-            res.error = strdup([@"addresses must be a non-empty JSON array" UTF8String]);
-            return res;
-        }
-
-        EKEventStore* store = get_store();
-        NSMutableArray<EKSource*>* sources = [NSMutableArray array];
-        SEL supSel = NSSelectorFromString(@"constraintSupportsAvailabilityRequests");
-        SEL cacheSel = NSSelectorFromString(@"availabilityCache");
-        for (EKSource* s in store.sources) {
-            if ([s respondsToSelector:supSel] &&
-                ((BOOL(*)(id, SEL))objc_msgSend)(s, supSel)) {
-                [sources addObject:s];
-            }
-        }
-        if (sources.count == 0) {
-            res.error = strdup([@"no calendar account supports availability lookups (iCloud does not; an Exchange or Google Workspace account is required)" UTF8String]);
-            return res;
-        }
-
-        SEL reqSel = NSSelectorFromString(@"requestAvailabilityBetweenStartDate:endDate:ignoredEventID:addresses:resultsBlock:completionBlock:");
-
-        // Free/busy visibility depends on which account asks: an address is
-        // typically only resolvable through a source in its own organization.
-        // Query every availability-capable source and merge — the first source
-        // that returns spans for a given address wins, so we don't clobber real
-        // data with an empty cross-domain result.
-        __block NSMutableDictionary* output = [NSMutableDictionary dictionary];
-        NSInteger attempted = 0;
-
-        for (EKSource* source in sources) {
-            id cache = [source respondsToSelector:cacheSel]
-                ? ((id(*)(id, SEL))objc_msgSend)(source, cacheSel) : nil;
-            if (!cache || ![cache respondsToSelector:reqSel]) continue;
-            attempted++;
-
-            dispatch_semaphore_t done = dispatch_semaphore_create(0);
-            void (^resultsBlock)(id) = ^(id results) {
-                if (![results isKindOfClass:[NSDictionary class]]) return;
-                [(NSDictionary*)results enumerateKeysAndObjectsUsingBlock:^(id addr, id spans, BOOL* stop) {
-                    NSString* key = [addr description];
-                    // Keep the first non-empty span set seen for this address.
-                    if ([output[key] isKindOfClass:[NSArray class]] && [output[key] count] > 0) return;
-                    NSMutableArray* arr = [NSMutableArray array];
-                    if ([spans isKindOfClass:[NSArray class]]) {
-                        for (id span in spans) {
-                            NSMutableDictionary* sd = [NSMutableDictionary dictionary];
-                            @try {
-                                NSDate* sd0 = [span valueForKey:@"startDate"];
-                                NSDate* sd1 = [span valueForKey:@"endDate"];
-                                if (sd0) sd[@"startDate"] = format_date(sd0);
-                                if (sd1) sd[@"endDate"] = format_date(sd1);
-                                SEL typeSel = NSSelectorFromString(@"type");
-                                if ([span respondsToSelector:typeSel]) {
-                                    sd[@"type"] = @(((NSInteger(*)(id, SEL))objc_msgSend)(span, typeSel));
-                                }
-                            } @catch (NSException* ex) {
-                                continue;
-                            }
-                            [arr addObject:sd];
-                        }
-                    }
-                    output[key] = arr;
-                }];
-            };
-            void (^completionBlock)(id) = ^(id err) {
-                dispatch_semaphore_signal(done);
-            };
-
-            @try {
-                ((void(*)(id, SEL, id, id, id, id, id, id))objc_msgSend)(
-                    cache, reqSel, start, end, (id)nil, addresses, resultsBlock, completionBlock);
-            } @catch (NSException* ex) {
-                dispatch_semaphore_signal(done);
-                continue;
-            }
-            // Bounded wait per source so one hung server can't block forever.
-            dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 15LL*NSEC_PER_SEC));
-        }
-
-        if (attempted == 0) {
-            res.error = strdup([@"availability cache is unavailable on this macOS" UTF8String]);
-            return res;
-        }
-        // Ensure every requested address appears, even with no spans.
-        for (NSString* a in addresses) {
-            if (!output[a]) output[a] = @[];
-        }
-        res.result = to_json(output);
-        if (!res.result) res.error = strdup("JSON serialization failed");
+// Public exception boundaries: exceptions never unwind into Go.
+ek_result_t ek_cal_request_access(void) {
+    @try { return impl_ek_cal_request_access(); }
+    @catch (NSException* exception) {
+        ek_result_t res = {NULL, NULL};
+        res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        return res;
     }
-    return res;
 }
 
-// --- Invitation inbox ---
-
-int ek_cal_notifications_selectors_available(void) {
-    return [get_store() respondsToSelector:NSSelectorFromString(@"eventNotifications")] ? 1 : 0;
-}
-
-// ek_cal_event_notifications returns pending event invitations as a JSON array
-// of {title,startDate,endDate,location,organizer,status,allDay}. Returns an
-// empty array when there are none or the private API is unavailable.
-ek_result_t ek_cal_event_notifications(void) {
-    ek_result_t res = {NULL, NULL};
-    @autoreleasepool {
-        EKEventStore* store = get_store();
-        SEL sel = NSSelectorFromString(@"eventNotifications");
-        if (![store respondsToSelector:sel]) {
-            res.result = strdup("[]");
-            return res;
-        }
-        id notifications = nil;
-        @try {
-            notifications = ((id(*)(id, SEL))objc_msgSend)(store, sel);
-        } @catch (NSException* ex) {
-            res.result = strdup("[]");
-            return res;
-        }
-        NSMutableArray* out = [NSMutableArray array];
-        if ([notifications isKindOfClass:[NSArray class]]) {
-            for (id n in notifications) {
-                NSMutableDictionary* d = [NSMutableDictionary dictionary];
-                @try {
-                    id title = [n valueForKey:@"title"];
-                    d[@"title"] = [title isKindOfClass:[NSString class]] ? title : @"";
-                } @catch (NSException* ex) { d[@"title"] = @""; }
-                @try {
-                    id sd = [n valueForKey:@"startDate"];
-                    if ([sd isKindOfClass:[NSDate class]]) d[@"startDate"] = format_date(sd);
-                } @catch (NSException* ex) {}
-                @try {
-                    id ed = [n valueForKey:@"endDate"];
-                    if ([ed isKindOfClass:[NSDate class]]) d[@"endDate"] = format_date(ed);
-                } @catch (NSException* ex) {}
-                @try {
-                    id loc = [n valueForKey:@"location"];
-                    d[@"location"] = [loc isKindOfClass:[NSString class]] ? loc : [NSNull null];
-                } @catch (NSException* ex) { d[@"location"] = [NSNull null]; }
-                @try {
-                    id by = [n valueForKey:@"invitedBy"];
-                    d[@"organizer"] = [by isKindOfClass:[NSString class]] ? by : [NSNull null];
-                } @catch (NSException* ex) { d[@"organizer"] = [NSNull null]; }
-                @try {
-                    SEL stSel = NSSelectorFromString(@"participationStatus");
-                    if ([n respondsToSelector:stSel])
-                        d[@"status"] = @(((NSInteger(*)(id, SEL))objc_msgSend)(n, stSel));
-                } @catch (NSException* ex) {}
-                @try {
-                    SEL adSel = NSSelectorFromString(@"isAllDay");
-                    if ([n respondsToSelector:adSel])
-                        d[@"allDay"] = ((BOOL(*)(id, SEL))objc_msgSend)(n, adSel) ? @YES : @NO;
-                } @catch (NSException* ex) {}
-                [out addObject:d];
-            }
-        }
-        res.result = to_json(out);
-        if (!res.result) res.error = strdup("JSON serialization failed");
+ek_result_t ek_cal_fetch_calendars(void) {
+    @try { return impl_ek_cal_fetch_calendars(); }
+    @catch (NSException* exception) {
+        ek_result_t res = {NULL, NULL};
+        res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        return res;
     }
-    return res;
+}
+
+ek_result_t ek_cal_fetch_events(const char* start_date, const char* end_date,
+                           const char* calendar_id, const char* search_query, int strict_id) {
+    @try { return impl_ek_cal_fetch_events(start_date, end_date, calendar_id, search_query, strict_id); }
+    @catch (NSException* exception) {
+        ek_result_t res = {NULL, NULL};
+        res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        return res;
+    }
+}
+
+ek_result_t ek_cal_get_event(const char* event_id) {
+    @try { return impl_ek_cal_get_event(event_id); }
+    @catch (NSException* exception) {
+        ek_result_t res = {NULL, NULL};
+        res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        return res;
+    }
+}
+
+ek_result_t ek_cal_create_event(const char* json_input) {
+    @try { return impl_ek_cal_create_event(json_input); }
+    @catch (NSException* exception) {
+        ek_result_t res = {NULL, NULL};
+        res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        return res;
+    }
+}
+
+ek_result_t ek_cal_update_event(const char* event_id, const char* json_input, int span) {
+    @try { return impl_ek_cal_update_event(event_id, json_input, span); }
+    @catch (NSException* exception) {
+        ek_result_t res = {NULL, NULL};
+        res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        return res;
+    }
+}
+
+ek_result_t ek_cal_create_calendar(const char* json_input) {
+    @try { return impl_ek_cal_create_calendar(json_input); }
+    @catch (NSException* exception) {
+        ek_result_t res = {NULL, NULL};
+        res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        return res;
+    }
+}
+
+ek_result_t ek_cal_update_calendar(const char* calendar_id, const char* json_input) {
+    @try { return impl_ek_cal_update_calendar(calendar_id, json_input); }
+    @catch (NSException* exception) {
+        ek_result_t res = {NULL, NULL};
+        res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        return res;
+    }
+}
+
+ek_result_t ek_cal_delete_calendar(const char* calendar_id) {
+    @try { return impl_ek_cal_delete_calendar(calendar_id); }
+    @catch (NSException* exception) {
+        ek_result_t res = {NULL, NULL};
+        res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        return res;
+    }
+}
+
+ek_result_t ek_cal_delete_event(const char* event_id, int span) {
+    @try { return impl_ek_cal_delete_event(event_id, span); }
+    @catch (NSException* exception) {
+        ek_result_t res = {NULL, NULL};
+        res.error = strdup([[NSString stringWithFormat:@"native operation failed: %@", exception.reason] UTF8String]);
+        return res;
+    }
 }

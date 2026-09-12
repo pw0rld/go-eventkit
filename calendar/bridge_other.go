@@ -3,7 +3,6 @@
 package calendar
 
 import (
-	"context"
 	"time"
 )
 
@@ -36,15 +35,6 @@ func (c *Client) UpdateEvent(id string, input UpdateEventInput, span Span) (*Eve
 // DeleteEvent permanently removes an event.
 func (c *Client) DeleteEvent(id string, span Span) error { return ErrUnsupported }
 
-// DeleteEvents permanently removes multiple events in a single bridge call.
-func (c *Client) DeleteEvents(ids []string, span Span) map[string]error {
-	result := make(map[string]error)
-	for _, id := range ids {
-		result[id] = ErrUnsupported
-	}
-	return result
-}
-
 // CreateCalendar creates a new calendar and returns it with its assigned ID.
 func (c *Client) CreateCalendar(input CreateCalendarInput) (*Calendar, error) {
 	return nil, ErrUnsupported
@@ -57,36 +47,3 @@ func (c *Client) UpdateCalendar(id string, input UpdateCalendarInput) (*Calendar
 
 // DeleteCalendar permanently removes a calendar and all its events.
 func (c *Client) DeleteCalendar(id string) error { return ErrUnsupported }
-
-// WatchChanges returns a channel that receives a value whenever the
-// EventKit calendar database changes.
-//
-// Returns [ErrUnsupported] on non-darwin platforms.
-func (c *Client) WatchChanges(ctx context.Context) (<-chan struct{}, error) {
-	return nil, ErrUnsupported
-}
-
-// AttendeeWritesSupported reports whether attendee writes are available.
-// Always false on non-darwin platforms.
-func (c *Client) AttendeeWritesSupported() bool { return false }
-
-// RSVPSupported reports whether the RSVP API is available.
-// Always false on non-darwin platforms.
-func (c *Client) RSVPSupported() bool { return false }
-
-// AvailabilitySupported reports whether the availability API is available.
-// Always false on non-darwin platforms.
-func (c *Client) AvailabilitySupported() bool { return false }
-
-// RespondToInvitation sets the user's RSVP status on an event.
-func (c *Client) RespondToInvitation(eventID string, status ParticipantStatus) error {
-	return ErrUnsupported
-}
-
-// RequestAvailability looks up free/busy spans for the given addresses.
-func (c *Client) RequestAvailability(addresses []string, start, end time.Time) (map[string][]AvailabilitySpan, error) {
-	return nil, ErrUnsupported
-}
-
-// PendingInvitations returns pending event invitations.
-func (c *Client) PendingInvitations() ([]Invitation, error) { return nil, ErrUnsupported }

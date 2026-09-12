@@ -55,20 +55,19 @@ import (
 	"errors"
 	"time"
 
-	"github.com/BRO3886/go-eventkit"
+	"github.com/pw0rld/go-eventkit"
 )
 
 // Client provides access to macOS Reminders via EventKit.
 //
-// Create a Client with [New]. All methods are safe to call from a single
-// goroutine. For concurrent usage from multiple goroutines, see the
-// concurrency notes in the package documentation.
+// Create a Client with New. Native store calls are serialized within the package.
 type Client struct{}
 
 // Sentinel errors returned by Client methods. Use [errors.Is] to check:
 //
 //	if errors.Is(err, reminders.ErrNotFound) { ... }
 var (
+	ErrSelection = errors.New("reminders: selection not found or ambiguous")
 	// ErrUnsupported is returned by [New] on non-darwin platforms.
 	ErrUnsupported = errors.New("reminders: not supported on this platform")
 
@@ -89,7 +88,7 @@ var (
 // Reminder represents a single reminder item (EKReminder).
 type Reminder struct {
 	// ID is the reminder's unique identifier (EKCalendarItem.calendarItemIdentifier).
-	// Can be used with [Client.Reminder] for lookup (full ID or prefix).
+	// Can be used with [Client.Reminder] for lookup by complete ID.
 	ID string `json:"id"`
 	// Title is the reminder's display title.
 	Title string `json:"title"`
@@ -115,13 +114,8 @@ type Reminder struct {
 	Priority Priority `json:"priority"`
 	// Completed is true if the reminder has been marked as done.
 	Completed bool `json:"completed"`
-	// Flagged indicates whether the reminder is flagged. Read via the private
-	// ReminderKit framework since EventKit does not expose this property.
-	Flagged bool `json:"flagged"`
 	// URL is an optional URL associated with the reminder.
 	URL string `json:"url,omitempty"`
-	// Tags are native Reminders hashtags without the leading "#".
-	Tags []string `json:"tags,omitempty"`
 	// Recurring is true if this reminder has recurrence rules.
 	Recurring bool `json:"recurring"`
 	// RecurrenceRules contains the recurrence patterns for this reminder.
@@ -143,23 +137,12 @@ type List struct {
 	// Color is the list's display color as a hex string (e.g., "#FF6961").
 	Color string `json:"color,omitempty"`
 	// Source is the account name this list belongs to (e.g., "iCloud").
-	Source string `json:"source,omitempty"`
+	Source   string `json:"source,omitempty"`
+	SourceID string `json:"sourceID"`
 	// Count is the number of reminders in this list.
 	Count int `json:"count"`
 	// ReadOnly is true if the list cannot be modified.
 	ReadOnly bool `json:"readOnly"`
-	// IsShared is true if the list is shared with other participants.
-	//
-	// Public EventKit does not expose sharing for reminder lists; this and
-	// the two fields below are read from the private ReminderKit backing
-	// object. When that API is unavailable the fields report the defaults
-	// for an unshared list (false, false, true).
-	IsShared bool `json:"isShared"`
-	// SharedToMe is true if the list is shared with the current user by
-	// someone else (as opposed to a list the user shares with others).
-	SharedToMe bool `json:"sharedToMe"`
-	// IsOwnedByMe is true if the current user owns the list.
-	IsOwnedByMe bool `json:"isOwnedByMe"`
 }
 
 // Alarm represents a reminder notification alert.
@@ -252,23 +235,24 @@ func ParsePriority(s string) Priority {
 type ListOption func(*listOptions)
 
 type listOptions struct {
-	listName  string
-	listID    string
-	completed *bool
-	search    string
-	dueBefore *time.Time
-	dueAfter  *time.Time
-	tags      []string
+	listName    string
+	listID      string
+	listIDSet   bool
+	listNameSet bool
+	completed   *bool
+	search      string
+	dueBefore   *time.Time
+	dueAfter    *time.Time
 }
 
 // WithList filters reminders by list name.
 func WithList(name string) ListOption {
-	return func(o *listOptions) { o.listName = name }
+	return func(o *listOptions) { o.listName = name; o.listNameSet = true }
 }
 
 // WithListID filters reminders by list identifier.
 func WithListID(id string) ListOption {
-	return func(o *listOptions) { o.listID = id }
+	return func(o *listOptions) { o.listID = id; o.listIDSet = true }
 }
 
 // WithCompleted filters reminders by completion status.
@@ -292,11 +276,6 @@ func WithDueAfter(t time.Time) ListOption {
 	return func(o *listOptions) { o.dueAfter = &t }
 }
 
-// WithTags filters reminders by native Reminders tags. Multiple tags use AND logic.
-func WithTags(tags ...string) ListOption {
-	return func(o *listOptions) { o.tags = append([]string(nil), tags...) }
-}
-
 // CreateListInput contains the fields for creating a new reminder list via
 // [Client.CreateList].
 //
@@ -306,7 +285,8 @@ type CreateListInput struct {
 	Title string
 	// Source is the account name to create the list in (required).
 	// Use [Client.Lists] to discover available source names (e.g., "iCloud").
-	Source string
+	Source   string
+	SourceID string
 	// Color is the list's display color as a hex string (e.g., "#FF6961").
 	// If empty, the system default color is used.
 	Color string
@@ -343,6 +323,7 @@ type CreateReminderInput struct {
 	// ListName is the name of the list to create the reminder in.
 	// If empty, the system default reminders list is used.
 	ListName string
+	ListID   string
 	// DueDate sets when the reminder is due. Nil for no due date.
 	DueDate *time.Time
 	// RemindMeDate sets when the notification alarm fires. Independent of DueDate.
@@ -351,11 +332,6 @@ type CreateReminderInput struct {
 	Priority Priority
 	// URL associates a URL with the reminder.
 	URL string
-	// Flagged sets the flagged state on creation. Written via the private
-	// ReminderKit framework since EventKit does not expose this property.
-	Flagged bool
-	// Tags sets native Reminders hashtags without the leading "#".
-	Tags []string
 	// Alarms adds notification alarms to the reminder.
 	Alarms []Alarm
 	// RecurrenceRules sets the recurrence pattern(s) for the reminder.
@@ -375,6 +351,7 @@ type UpdateReminderInput struct {
 	Notes *string
 	// ListName moves the reminder to a different list by name.
 	ListName *string
+	ListID   *string
 	// DueDate updates the due date. See also ClearDueDate.
 	DueDate *time.Time
 	// ClearDueDate removes the due date entirely when set to true.
@@ -387,14 +364,8 @@ type UpdateReminderInput struct {
 	// Completed marks the reminder as completed (true) or incomplete (false).
 	// For a dedicated API, see [Client.CompleteReminder] and [Client.UncompleteReminder].
 	Completed *bool
-	// Flagged updates the flagged state. Written via the private ReminderKit
-	// framework since EventKit does not expose this property.
-	Flagged *bool
 	// URL updates the associated URL.
 	URL *string
-	// Tags replaces native Reminders hashtags. Pass an empty slice to remove all tags.
-	// Pass nil to leave tags unchanged.
-	Tags *[]string
 	// Alarms replaces all existing alarms. Pass an empty slice to remove all alarms.
 	Alarms *[]Alarm
 	// RecurrenceRules replaces all existing recurrence rules.

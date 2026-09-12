@@ -7,5 +7,5 @@ integration
 # Coverage
 coverage.out
 
-# Journals (symlink to ~/projects/work-journals/go-eventkit)
-journals
+# Local validation binaries
+.build/

@@ -19,7 +19,7 @@ ek_result_t ek_cal_fetch_calendars(void);
 // calendar_id and search_query may be NULL to skip filtering.
 // Caller must free result with ek_cal_free.
 ek_result_t ek_cal_fetch_events(const char* start_date, const char* end_date,
-                           const char* calendar_id, const char* search_query);
+                           const char* calendar_id, const char* search_query, int strict_id);
 
 // ek_cal_get_event returns a single event as JSON by its eventIdentifier.
 // Caller must free result with ek_cal_free.
@@ -53,51 +53,8 @@ ek_result_t ek_cal_update_calendar(const char* calendar_id, const char* json_inp
 // Returns "ok" on success. Caller must free result.
 ek_result_t ek_cal_delete_calendar(const char* calendar_id);
 
-// ek_cal_delete_events deletes multiple events in a single bridge call.
-// json_ids is a JSON array of event identifiers.
-// span is 0 for this event only, 1 for future events.
-// Returns a JSON object mapping failed event IDs to error messages.
-// Caller must free result with ek_cal_free.
-ek_result_t ek_cal_delete_events(const char* json_ids, int span);
-
 // ek_cal_free frees a string returned by the above functions.
 void ek_cal_free(char* ptr);
 
-// ek_cal_conference_selectors_available reports whether the private EKEvent
-// conference URL accessors exist on this macOS. Returns 1 if available, 0 if
-// Apple removed them (early-warning canary; reads then rely on Go fallback).
-int ek_cal_conference_selectors_available(void);
-
-// Capability canaries for the private scheduling APIs. Each returns 1 if the
-// underlying private selectors/classes exist on this macOS, 0 otherwise.
-int ek_cal_attendee_selectors_available(void);
-int ek_cal_rsvp_selectors_available(void);
-int ek_cal_availability_selectors_available(void);
-int ek_cal_notifications_selectors_available(void);
-
-// ek_cal_respond_to_event sets the current user's RSVP status on an event.
-// status uses EKParticipantStatus values (2=accepted, 3=declined, 4=tentative).
-// Returns "ok" on success. Caller must free result.
-ek_result_t ek_cal_respond_to_event(const char* event_id, int status);
-
-// ek_cal_request_availability returns free/busy spans for a JSON array of
-// addresses between start_date and end_date (ISO 8601). Result is a JSON object
-// mapping each address to an array of {startDate,endDate,type} spans.
-// Caller must free result.
-ek_result_t ek_cal_request_availability(const char* start_date, const char* end_date, const char* json_addresses);
-
-// ek_cal_event_notifications returns pending event invitations as a JSON array.
-// Caller must free result.
-ek_result_t ek_cal_event_notifications(void);
-
-// ek_cal_watch_start registers EKEventStoreChangedNotification observer and
-// creates a pipe. Returns 1 on success, 0 on failure.
-int ek_cal_watch_start(void);
-
-// ek_cal_watch_read_fd returns the read end of the notification pipe, or -1.
-int ek_cal_watch_read_fd(void);
-
-// ek_cal_watch_stop removes the observer and closes the pipe.
-void ek_cal_watch_stop(void);
 
 #endif

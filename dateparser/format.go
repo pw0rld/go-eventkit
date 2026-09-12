@@ -59,15 +59,22 @@ func ParseAlertDuration(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid alert duration: %q (use e.g. 15m, 1h, 1d)", s)
 	}
 
-	n, _ := strconv.Atoi(m[1])
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("alert duration overflow: %w", err)
+	}
 	unit := m[2]
+	var scale time.Duration
 	switch {
 	case strings.HasPrefix(unit, "m"):
-		return time.Duration(n) * time.Minute, nil
+		scale = time.Minute
 	case strings.HasPrefix(unit, "h"):
-		return time.Duration(n) * time.Hour, nil
+		scale = time.Hour
 	case strings.HasPrefix(unit, "d"):
-		return time.Duration(n) * 24 * time.Hour, nil
+		scale = 24 * time.Hour
 	}
-	return 0, fmt.Errorf("invalid alert duration: %q", s)
+	if scale == 0 || n > int64(1<<63-1)/int64(scale) {
+		return 0, fmt.Errorf("alert duration out of range")
+	}
+	return time.Duration(n) * scale, nil
 }

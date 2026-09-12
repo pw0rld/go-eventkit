@@ -49,13 +49,14 @@ import (
 	"errors"
 	"time"
 
-	"github.com/BRO3886/go-eventkit"
+	"github.com/pw0rld/go-eventkit"
 )
 
 // Sentinel errors returned by Client methods. Use [errors.Is] to check:
 //
 //	if errors.Is(err, calendar.ErrNotFound) { ... }
 var (
+	ErrSelection = errors.New("calendar: selection not found or ambiguous")
 	// ErrUnsupported is returned by [New] on non-darwin platforms.
 	ErrUnsupported = errors.New("calendar: only supported on macOS (darwin)")
 
@@ -71,18 +72,11 @@ var (
 	// [Client.DeleteCalendar] when the target calendar is immutable
 	// (e.g., subscribed or birthday calendars).
 	ErrImmutable = errors.New("calendar: calendar is immutable")
-
-	// ErrUnsupportedFeature is returned by scheduling methods (attendee
-	// writes, RSVP, availability) when the private EventKit API they rely on
-	// is not present on the running macOS version.
-	ErrUnsupportedFeature = errors.New("calendar: feature not supported on this macOS")
 )
 
 // Client provides access to macOS Calendar via EventKit.
 //
-// Create a Client with [New]. All methods are safe to call from a single
-// goroutine. For concurrent usage from multiple goroutines, see the
-// concurrency notes in the package documentation.
+// Create a Client with New. Native store calls are serialized within the package.
 type Client struct{}
 
 // Calendar represents a calendar container (e.g., "Work", "Personal", "Holidays").
@@ -97,7 +91,8 @@ type Calendar struct {
 	// Color is the calendar's display color as a hex string (e.g., "#FF6961").
 	Color string `json:"color"`
 	// Source is the account name this calendar belongs to (e.g., "iCloud", "Gmail").
-	Source string `json:"source"`
+	Source   string `json:"source"`
+	SourceID string `json:"sourceID"`
 	// ReadOnly is true for calendars that cannot be modified (subscriptions, birthdays).
 	ReadOnly bool `json:"readOnly"`
 }
@@ -121,19 +116,9 @@ type Event struct {
 	Notes string `json:"notes"`
 	// URL is an optional URL associated with the event (e.g., a meeting link).
 	URL string `json:"url"`
-	// ConferenceURL is the video-conference join link for this event, if any —
-	// the same link Calendar.app shows as its "Join" button. It is read from a
-	// private EventKit accessor when available; otherwise it is detected from
-	// the event's URL, location, and notes via [DetectConferenceURL]. Empty
-	// when the event has no recognizable conference link. Read-only.
+	// ConferenceURL is detected from the public URL, location and notes fields.
+	// It is empty when no supported conference link is present. Read-only.
 	ConferenceURL string `json:"conferenceURL,omitempty"`
-	// TravelTime is the travel time configured before the event. Zero when
-	// none is set. Read via a private EventKit accessor; zero if unavailable.
-	TravelTime time.Duration `json:"travelTime,omitempty"`
-	// SelfStatus is the current user's RSVP status for this event when it is an
-	// invitation (see [ParticipantStatus]). [ParticipantStatusUnknown] for
-	// events the user owns or that carry no invitation.
-	SelfStatus ParticipantStatus `json:"selfStatus,omitempty"`
 	// Calendar is the display name of the calendar this event belongs to.
 	Calendar string `json:"calendar"`
 	// CalendarID is the identifier of the calendar this event belongs to.
@@ -341,6 +326,7 @@ type ListOption func(*listOptions)
 type listOptions struct {
 	calendarNames []string
 	calendarID    string
+	calendarIDSet bool
 	searchQuery   string
 }
 
@@ -354,7 +340,10 @@ func WithCalendar(name string) ListOption {
 // WithCalendars filters events by multiple calendar names.
 func WithCalendars(names []string) ListOption {
 	return func(o *listOptions) {
-		o.calendarNames = names
+		o.calendarNames = append([]string{}, names...)
+		if len(o.calendarNames) == 0 {
+			o.calendarNames = []string{""}
+		}
 	}
 }
 
@@ -362,6 +351,7 @@ func WithCalendars(names []string) ListOption {
 func WithCalendarID(id string) ListOption {
 	return func(o *listOptions) {
 		o.calendarID = id
+		o.calendarIDSet = true
 	}
 }
 
@@ -394,7 +384,8 @@ type CreateEventInput struct {
 	URL string `json:"url"`
 	// Calendar is the name of the calendar to create the event in.
 	// If empty, the system default calendar is used.
-	Calendar string `json:"calendar"`
+	Calendar   string `json:"calendar"`
+	CalendarID string `json:"calendarID,omitempty"`
 	// Alerts configures notification alerts before the event.
 	Alerts []Alert `json:"alerts"`
 	// SuppressDefaultAlarms prevents the calendar's default alarms from
@@ -416,24 +407,6 @@ type CreateEventInput struct {
 	// If set, this takes precedence over Location for map integrations.
 	// The plain Location string is set independently.
 	StructuredLocation *eventkit.StructuredLocation `json:"structuredLocation,omitempty"`
-	// Attendees invites participants to the event. This uses a private
-	// EventKit API (the public API is read-only); when an attendee is added on
-	// a server-backed calendar (iCloud, Exchange, Google), saving the event
-	// sends an invitation email. [Client.CreateEvent] returns an error if the
-	// private API is unavailable on this macOS. Use [Client.AttendeeWritesSupported]
-	// to check first.
-	Attendees []AttendeeInput `json:"attendees,omitempty"`
-	// TravelTime sets travel time before the event. Uses a private EventKit
-	// accessor; ignored if unavailable.
-	TravelTime time.Duration `json:"travelTime,omitempty"`
-}
-
-// AttendeeInput describes a participant to invite to an event.
-type AttendeeInput struct {
-	// Email is the attendee's email address (required).
-	Email string `json:"email"`
-	// Name is the attendee's display name. Defaults to Email if empty.
-	Name string `json:"name,omitempty"`
 }
 
 // UpdateEventInput contains fields for updating an existing event via
@@ -450,7 +423,8 @@ type UpdateEventInput struct {
 	Notes     *string    `json:"notes,omitempty"`
 	URL       *string    `json:"url,omitempty"`
 	// Calendar moves the event to a different calendar by name.
-	Calendar *string `json:"calendar,omitempty"`
+	Calendar   *string `json:"calendar,omitempty"`
+	CalendarID *string `json:"calendarID,omitempty"`
 	// Alerts replaces all existing alerts. Pass an empty slice to remove all alerts.
 	Alerts   *[]Alert `json:"alerts,omitempty"`
 	TimeZone *string  `json:"timeZone,omitempty"`
@@ -461,58 +435,6 @@ type UpdateEventInput struct {
 	// StructuredLocation updates the geographic location. Set to non-nil to
 	// update, leave nil to keep unchanged.
 	StructuredLocation *eventkit.StructuredLocation `json:"structuredLocation,omitempty"`
-	// Attendees adds participants to the event (private API; the public API is
-	// read-only). Adding an attendee on a server-backed calendar sends an
-	// invitation on save. Nil leaves attendees unchanged; this cannot remove
-	// existing attendees.
-	Attendees []AttendeeInput `json:"attendees,omitempty"`
-	// TravelTime sets travel time before the event. Nil leaves it unchanged.
-	TravelTime *time.Duration `json:"travelTime,omitempty"`
-}
-
-// AvailabilityType is the free/busy classification of a time span returned by
-// [Client.RequestAvailability].
-type AvailabilityType int
-
-const (
-	AvailabilityTypeFree        AvailabilityType = 0
-	AvailabilityTypeBusy        AvailabilityType = 1
-	AvailabilityTypeTentative   AvailabilityType = 2
-	AvailabilityTypeUnavailable AvailabilityType = 3
-)
-
-// String returns a human-readable representation of the availability type.
-func (a AvailabilityType) String() string {
-	switch a {
-	case AvailabilityTypeFree:
-		return "free"
-	case AvailabilityTypeBusy:
-		return "busy"
-	case AvailabilityTypeTentative:
-		return "tentative"
-	case AvailabilityTypeUnavailable:
-		return "unavailable"
-	default:
-		return "unknown"
-	}
-}
-
-// AvailabilitySpan is a single free/busy period for an address.
-type AvailabilitySpan struct {
-	Start time.Time        `json:"start"`
-	End   time.Time        `json:"end"`
-	Type  AvailabilityType `json:"type"`
-}
-
-// Invitation is a pending event invitation in the user's notification inbox.
-type Invitation struct {
-	Title     string            `json:"title"`
-	Start     time.Time         `json:"start"`
-	End       time.Time         `json:"end"`
-	Location  string            `json:"location,omitempty"`
-	Organizer string            `json:"organizer,omitempty"`
-	Status    ParticipantStatus `json:"status"`
-	AllDay    bool              `json:"allDay"`
 }
 
 // CreateCalendarInput contains the fields for creating a new calendar via
@@ -525,7 +447,8 @@ type CreateCalendarInput struct {
 	// Source is the account name to create the calendar in (required).
 	// Use [Client.Calendars] to discover available source names (e.g., "iCloud",
 	// "siddverma1999@gmail.com"). Not all sources support calendar creation.
-	Source string
+	Source   string
+	SourceID string
 	// Color is the calendar's display color as a hex string (e.g., "#FF6961").
 	// If empty, the system default color is used.
 	Color string

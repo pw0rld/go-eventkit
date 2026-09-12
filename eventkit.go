@@ -61,6 +61,40 @@ type RecurrenceRule struct {
 // constraints. It returns a descriptive error for the first violation found,
 // or nil if the rule is valid.
 func (r RecurrenceRule) Validate() error {
+	if r.Frequency < FrequencyDaily || r.Frequency > FrequencyYearly {
+		return fmt.Errorf("invalid recurrence frequency: %d", r.Frequency)
+	}
+	for _, d := range r.DaysOfTheWeek {
+		if d.DayOfTheWeek < Sunday || d.DayOfTheWeek > Saturday || d.WeekNumber < -53 || d.WeekNumber > 53 {
+			return fmt.Errorf("invalid recurrence weekday or week number")
+		}
+	}
+	for _, a := range []struct {
+		name     string
+		values   []int
+		max      int
+		negative bool
+	}{
+		{"daysOfTheMonth", r.DaysOfTheMonth, 31, true},
+		{"monthsOfTheYear", r.MonthsOfTheYear, 12, false},
+		{"weeksOfTheYear", r.WeeksOfTheYear, 53, true},
+		{"daysOfTheYear", r.DaysOfTheYear, 366, true},
+		{"setPositions", r.SetPositions, 366, true},
+	} {
+		for _, n := range a.values {
+			if n == 0 || n > a.max || n < -a.max || (!a.negative && n < 0) {
+				return fmt.Errorf("invalid %s value: %d", a.name, n)
+			}
+		}
+	}
+	if r.End != nil {
+		if r.End.EndDate != nil && (r.End.EndDate.IsZero() || r.End.EndDate.Year() < 1 || r.End.EndDate.Year() > 9999) {
+			return fmt.Errorf("invalid recurrence end date")
+		}
+		if r.End.OccurrenceCount < 0 || (r.End.EndDate != nil && r.End.OccurrenceCount != 0) {
+			return fmt.Errorf("use one recurrence end condition")
+		}
+	}
 	if r.Interval < 1 {
 		return fmt.Errorf("interval must be >= 1, got %d", r.Interval)
 	}

@@ -23,10 +23,9 @@ ek_result_t ek_rem_fetch_reminders(const char* list_name,
                               const char* completed_filter,
                               const char* search_query,
                               const char* due_before,
-                              const char* due_after,
-                              const char* tags_json);
+                              const char* due_after, int strict_id);
 
-// ek_rem_get_reminder returns a single reminder as JSON by ID or ID prefix.
+// ek_rem_get_reminder returns a single reminder as JSON by exact ID.
 // Caller must free the result string with ek_rem_free.
 ek_result_t ek_rem_get_reminder(const char* target_id);
 
@@ -65,23 +64,8 @@ ek_result_t ek_rem_update_list(const char* list_id, const char* json_input);
 // Returns "ok" in result on success. Caller must free.
 ek_result_t ek_rem_delete_list(const char* list_id);
 
-// ek_rem_delete_reminders deletes multiple reminders in a single bridge call.
-// json_ids is a JSON array of reminder identifiers.
-// Returns a JSON object mapping failed reminder IDs to error messages.
-// Caller must free result with ek_rem_free.
-ek_result_t ek_rem_delete_reminders(const char* json_ids);
-
 // ek_rem_free frees a string returned by the above functions.
 void ek_rem_free(char* ptr);
 
-// ek_rem_watch_start registers EKEventStoreChangedNotification observer and
-// creates a pipe. Returns 1 on success, 0 on failure.
-int ek_rem_watch_start(void);
-
-// ek_rem_watch_read_fd returns the read end of the notification pipe, or -1.
-int ek_rem_watch_read_fd(void);
-
-// ek_rem_watch_stop removes the observer and closes the pipe.
-void ek_rem_watch_stop(void);
 
 #endif

@@ -2,8 +2,6 @@
 
 package reminders
 
-import "context"
-
 // New creates a new Reminders [Client] and requests reminders access.
 //
 // On non-darwin platforms, this always returns [ErrUnsupported].
@@ -21,7 +19,7 @@ func (c *Client) Reminders(opts ...ListOption) ([]Reminder, error) {
 	return nil, ErrUnsupported
 }
 
-// Reminder returns a single reminder by ID or ID prefix.
+// Reminder returns a single reminder by complete ID.
 func (c *Client) Reminder(id string) (*Reminder, error) {
 	return nil, ErrUnsupported
 }
@@ -39,15 +37,6 @@ func (c *Client) UpdateReminder(id string, input UpdateReminderInput) (*Reminder
 // DeleteReminder permanently deletes a reminder by ID.
 func (c *Client) DeleteReminder(id string) error {
 	return ErrUnsupported
-}
-
-// DeleteReminders permanently removes multiple reminders in a single bridge call.
-func (c *Client) DeleteReminders(ids []string) map[string]error {
-	result := make(map[string]error)
-	for _, id := range ids {
-		result[id] = ErrUnsupported
-	}
-	return result
 }
 
 // CreateList creates a new reminder list and returns it with its assigned ID.
@@ -68,13 +57,5 @@ func (c *Client) CompleteReminder(id string) (*Reminder, error) {
 
 // UncompleteReminder marks a reminder as incomplete and returns the updated version.
 func (c *Client) UncompleteReminder(id string) (*Reminder, error) {
-	return nil, ErrUnsupported
-}
-
-// WatchChanges returns a channel that receives a value whenever the
-// EventKit reminders database changes.
-//
-// Returns [ErrUnsupported] on non-darwin platforms.
-func (c *Client) WatchChanges(ctx context.Context) (<-chan struct{}, error) {
 	return nil, ErrUnsupported
 }

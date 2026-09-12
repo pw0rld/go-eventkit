@@ -10,30 +10,32 @@ package reminders
 */
 import "C"
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"github.com/pw0rld/go-eventkit/internal/validate"
 	"strings"
 	"sync"
 	"unsafe"
 )
 
-var remWatchMu sync.Mutex
-var remWatchActive bool
+var bridgeMu sync.Mutex
 
 func resultErr(res C.ek_result_t) error {
 	if res.error != nil {
 		msg := C.GoString(res.error)
 		C.ek_rem_free(res.error)
+		if strings.Contains(msg, "ambiguous") {
+			return fmt.Errorf("%w: %s", ErrSelection, msg)
+		}
+		if strings.Contains(msg, "not found") {
+			return fmt.Errorf("%w: %s", ErrNotFound, msg)
+		}
+		if strings.Contains(msg, "immutable") {
+			return fmt.Errorf("%w: %s", ErrImmutable, msg)
+		}
 		return errors.New(msg)
 	}
 	return errors.New("unknown error")
-}
-
-func containsLower(s, substr string) bool {
-	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
 
 // New creates a new Reminders [Client] and requests reminders access.
@@ -42,9 +44,15 @@ func containsLower(s, substr string) bool {
 // Returns [ErrAccessDenied] if the user denies access.
 // Returns [ErrUnsupported] on non-darwin platforms.
 func New() (*Client, error) {
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	res := C.ek_rem_request_access()
 	if res.error != nil {
-		return nil, fmt.Errorf("%w: %s", ErrAccessDenied, resultErr(res))
+		err := resultErr(res)
+		if strings.Contains(err.Error(), "access denied") {
+			return nil, fmt.Errorf("%w: %s", ErrAccessDenied, err)
+		}
+		return nil, err
 	}
 	C.ek_rem_free(res.result)
 	return &Client{}, nil
@@ -52,6 +60,8 @@ func New() (*Client, error) {
 
 // Lists returns all reminder lists across all accounts (iCloud, Exchange, etc.).
 func (c *Client) Lists() ([]List, error) {
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	res := C.ek_rem_fetch_lists()
 	if res.error != nil {
 		return nil, fmt.Errorf("reminders: %w", resultErr(res))
@@ -64,17 +74,23 @@ func (c *Client) Lists() ([]List, error) {
 // With no options, returns all reminders across all lists.
 // Options can filter by list, completion status, search query, and due date range.
 func (c *Client) Reminders(opts ...ListOption) ([]Reminder, error) {
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	o := applyOptions(opts)
+	if err := validateQuery(o); err != nil {
+		return nil, err
+	}
+	strictID := C.int(0)
+	if o.listIDSet {
+		strictID = 1
+	}
 
-	var cList, cCompleted, cSearch, cBefore, cAfter, cTags *C.char
+	var cList, cCompleted, cSearch, cBefore, cAfter *C.char
 
 	if o.listName != "" {
 		cList = C.CString(o.listName)
 		defer C.free(unsafe.Pointer(cList))
 	} else if o.listID != "" {
-		// Use list ID as name — the bridge resolves by name (case-insensitive).
-		// For ID-based filtering, we'd need a separate bridge function.
-		// For now, pass it through — the bridge will try name match.
 		cList = C.CString(o.listID)
 		defer C.free(unsafe.Pointer(cList))
 	}
@@ -100,16 +116,8 @@ func (c *Client) Reminders(opts ...ListOption) ([]Reminder, error) {
 		cAfter = C.CString(s)
 		defer C.free(unsafe.Pointer(cAfter))
 	}
-	if len(o.tags) > 0 {
-		data, err := json.Marshal(o.tags)
-		if err != nil {
-			return nil, fmt.Errorf("reminders: failed to marshal tags filter: %w", err)
-		}
-		cTags = C.CString(string(data))
-		defer C.free(unsafe.Pointer(cTags))
-	}
 
-	res := C.ek_rem_fetch_reminders(cList, cCompleted, cSearch, cBefore, cAfter, cTags)
+	res := C.ek_rem_fetch_reminders(cList, cCompleted, cSearch, cBefore, cAfter, strictID)
 	if res.error != nil {
 		return nil, fmt.Errorf("reminders: %w", resultErr(res))
 	}
@@ -118,15 +126,20 @@ func (c *Client) Reminders(opts ...ListOption) ([]Reminder, error) {
 }
 
 // Reminder returns a single reminder by ID.
-// Accepts a full identifier or a unique prefix (e.g., first 8 characters).
+// Requires the complete identifier returned by the store; prefixes are rejected.
 // Returns [ErrNotFound] if no reminder matches.
 func (c *Client) Reminder(id string) (*Reminder, error) {
+	if err := validate.ID(id); err != nil {
+		return nil, err
+	}
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	cID := C.CString(id)
 	defer C.free(unsafe.Pointer(cID))
 
 	res := C.ek_rem_get_reminder(cID)
 	if res.error != nil {
-		return nil, fmt.Errorf("%w: %s", ErrNotFound, resultErr(res))
+		return nil, resultErr(res)
 	}
 	defer C.ek_rem_free(res.result)
 	return parseReminderJSON(C.GoString(res.result))
@@ -135,6 +148,8 @@ func (c *Client) Reminder(id string) (*Reminder, error) {
 // CreateReminder creates a new reminder and returns it with its assigned ID.
 // The reminder is saved to the EventKit store immediately.
 func (c *Client) CreateReminder(input CreateReminderInput) (*Reminder, error) {
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	for _, rule := range input.RecurrenceRules {
 		if err := rule.Validate(); err != nil {
 			return nil, fmt.Errorf("reminders: invalid recurrence rule: %w", err)
@@ -161,6 +176,11 @@ func (c *Client) CreateReminder(input CreateReminderInput) (*Reminder, error) {
 // Only non-nil fields in the input are modified. Returns [ErrNotFound] if the
 // reminder does not exist.
 func (c *Client) UpdateReminder(id string, input UpdateReminderInput) (*Reminder, error) {
+	if err := validate.ID(id); err != nil {
+		return nil, err
+	}
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	if input.RecurrenceRules != nil {
 		for _, rule := range *input.RecurrenceRules {
 			if err := rule.Validate(); err != nil {
@@ -190,6 +210,11 @@ func (c *Client) UpdateReminder(id string, input UpdateReminderInput) (*Reminder
 // DeleteReminder permanently deletes a reminder by ID.
 // Returns [ErrNotFound] if the reminder does not exist.
 func (c *Client) DeleteReminder(id string) error {
+	if err := validate.ID(id); err != nil {
+		return err
+	}
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	cID := C.CString(id)
 	defer C.free(unsafe.Pointer(cID))
 
@@ -201,56 +226,12 @@ func (c *Client) DeleteReminder(id string) error {
 	return nil
 }
 
-// DeleteReminders permanently removes multiple reminders in a single bridge call.
-// Returns a map of reminder ID to error for any reminders that failed to delete.
-// Reminders that don't exist are silently skipped (not included in the error map).
-// Returns nil if all deletions succeed (or ids is empty).
-func (c *Client) DeleteReminders(ids []string) map[string]error {
-	if len(ids) == 0 {
-		return nil
-	}
-
-	jsonBytes, err := json.Marshal(ids)
-	if err != nil {
-		result := make(map[string]error)
-		for _, id := range ids {
-			result[id] = fmt.Errorf("reminders: failed to marshal input: %w", err)
-		}
-		return result
-	}
-
-	cJSON := C.CString(string(jsonBytes))
-	defer C.free(unsafe.Pointer(cJSON))
-
-	res := C.ek_rem_delete_reminders(cJSON)
-	if res.error != nil {
-		errMsg := resultErr(res)
-		result := make(map[string]error)
-		for _, id := range ids {
-			result[id] = fmt.Errorf("reminders: %w", errMsg)
-		}
-		return result
-	}
-	defer C.ek_rem_free(res.result)
-
-	var errMap map[string]string
-	if err := json.Unmarshal([]byte(C.GoString(res.result)), &errMap); err != nil {
-		return nil
-	}
-	if len(errMap) == 0 {
-		return nil
-	}
-	result := make(map[string]error, len(errMap))
-	for id, msg := range errMap {
-		result[id] = errors.New(msg)
-	}
-	return result
-}
-
 // CreateList creates a new reminder list and returns it with its assigned ID.
 // The list is saved to the EventKit store immediately.
 func (c *Client) CreateList(input CreateListInput) (*List, error) {
-	if input.Source == "" {
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
+	if input.Source == "" && input.SourceID == "" {
 		return nil, fmt.Errorf("reminders: source is required")
 	}
 	jsonStr, err := marshalCreateListInput(input)
@@ -283,6 +264,11 @@ func (c *Client) CreateList(input CreateListInput) (*List, error) {
 // Returns [ErrNotFound] if the list does not exist.
 // Returns [ErrImmutable] if the list is immutable.
 func (c *Client) UpdateList(id string, input UpdateListInput) (*List, error) {
+	if err := validate.ID(id); err != nil {
+		return nil, err
+	}
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	jsonStr, err := marshalUpdateListInput(input)
 	if err != nil {
 		return nil, err
@@ -296,10 +282,10 @@ func (c *Client) UpdateList(id string, input UpdateListInput) (*List, error) {
 	res := C.ek_rem_update_list(cID, cJSON)
 	if res.error != nil {
 		err := resultErr(res)
-		if containsLower(err.Error(), "not found") {
+		if errors.Is(err, ErrNotFound) {
 			return nil, ErrNotFound
 		}
-		if containsLower(err.Error(), "immutable") {
+		if errors.Is(err, ErrImmutable) {
 			return nil, ErrImmutable
 		}
 		return nil, fmt.Errorf("reminders: %w", err)
@@ -321,16 +307,21 @@ func (c *Client) UpdateList(id string, input UpdateListInput) (*List, error) {
 // Returns [ErrNotFound] if the list does not exist.
 // Returns [ErrImmutable] if the list is immutable.
 func (c *Client) DeleteList(id string) error {
+	if err := validate.ID(id); err != nil {
+		return err
+	}
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	cID := C.CString(id)
 	defer C.free(unsafe.Pointer(cID))
 
 	res := C.ek_rem_delete_list(cID)
 	if res.error != nil {
 		err := resultErr(res)
-		if containsLower(err.Error(), "not found") {
+		if errors.Is(err, ErrNotFound) {
 			return ErrNotFound
 		}
-		if containsLower(err.Error(), "immutable") {
+		if errors.Is(err, ErrImmutable) {
 			return ErrImmutable
 		}
 		return fmt.Errorf("reminders: %w", err)
@@ -343,6 +334,11 @@ func (c *Client) DeleteList(id string) error {
 // Sets [Reminder.Completed] to true and [Reminder.CompletionDate] to now.
 // Returns [ErrNotFound] if the reminder does not exist.
 func (c *Client) CompleteReminder(id string) (*Reminder, error) {
+	if err := validate.ID(id); err != nil {
+		return nil, err
+	}
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	cID := C.CString(id)
 	defer C.free(unsafe.Pointer(cID))
 
@@ -358,6 +354,11 @@ func (c *Client) CompleteReminder(id string) (*Reminder, error) {
 // Sets [Reminder.Completed] to false and clears [Reminder.CompletionDate].
 // Returns [ErrNotFound] if the reminder does not exist.
 func (c *Client) UncompleteReminder(id string) (*Reminder, error) {
+	if err := validate.ID(id); err != nil {
+		return nil, err
+	}
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	cID := C.CString(id)
 	defer C.free(unsafe.Pointer(cID))
 
@@ -367,59 +368,4 @@ func (c *Client) UncompleteReminder(id string) (*Reminder, error) {
 	}
 	defer C.ek_rem_free(res.result)
 	return parseReminderJSON(C.GoString(res.result))
-}
-
-// WatchChanges returns a channel that receives a value whenever the
-// EventKit reminders database changes. Changes include writes by this
-// process (CreateReminder, UpdateReminder, DeleteReminder, CreateList,
-// etc.), iCloud sync, Reminders.app edits, and changes by other apps
-// with reminders access.
-//
-// The channel is closed when ctx is cancelled or an internal read error
-// occurs. After ctx cancellation, any pending signals already in the
-// channel buffer are still readable.
-//
-// The channel carries no information about what specifically changed.
-// Callers should re-fetch the data they care about after each signal.
-// The channel is buffered (capacity 16); if the consumer falls behind,
-// excess signals are dropped rather than blocking.
-//
-// Only one watcher may be active per process. A second call to
-// WatchChanges while the first is active returns an error.
-//
-// Returns [ErrUnsupported] on non-darwin platforms.
-func (c *Client) WatchChanges(ctx context.Context) (<-chan struct{}, error) {
-	remWatchMu.Lock()
-	if remWatchActive {
-		remWatchMu.Unlock()
-		return nil, errors.New("reminders: watcher already active")
-	}
-	if C.ek_rem_watch_start() == 0 {
-		remWatchMu.Unlock()
-		return nil, errors.New("reminders: failed to start watcher")
-	}
-	remWatchActive = true
-	remWatchMu.Unlock()
-
-	fd := int(C.ek_rem_watch_read_fd())
-	f := os.NewFile(uintptr(fd), "ek-rem-watch-pipe")
-
-	ch := make(chan struct{}, 16)
-	go func() {
-		defer func() {
-			C.ek_rem_watch_stop()
-			remWatchMu.Lock()
-			remWatchActive = false
-			remWatchMu.Unlock()
-			close(ch)
-		}()
-		inner := watchChangesFromFile(ctx, f)
-		for range inner {
-			select {
-			case ch <- struct{}{}:
-			default:
-			}
-		}
-	}()
-	return ch, nil
 }

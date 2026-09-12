@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/BRO3886/go-eventkit"
+	"github.com/pw0rld/go-eventkit"
+	"github.com/pw0rld/go-eventkit/internal/validate"
 )
 
 // rawReminder is the intermediate JSON representation from the ObjC bridge.
@@ -22,9 +23,7 @@ type rawReminder struct {
 	ModifiedAt      *string             `json:"modifiedAt"`
 	Priority        int                 `json:"priority"`
 	Completed       bool                `json:"completed"`
-	Flagged         bool                `json:"flagged"`
 	URL             *string             `json:"url"`
-	Tags            []string            `json:"tags"`
 	Recurring       bool                `json:"recurring"`
 	RecurrenceRules []rawRecurrenceRule `json:"recurrenceRules"`
 	HasAlarms       bool                `json:"hasAlarms"`
@@ -71,15 +70,13 @@ type rawRecurrenceEnd struct {
 
 // rawList is the intermediate JSON representation of a reminder list.
 type rawList struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Color       string `json:"color"`
-	Source      string `json:"source"`
-	Count       int    `json:"count"`
-	ReadOnly    bool   `json:"readOnly"`
-	IsShared    bool   `json:"isShared"`
-	SharedToMe  bool   `json:"sharedToMe"`
-	IsOwnedByMe bool   `json:"isOwnedByMe"`
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Color    string `json:"color"`
+	Source   string `json:"source"`
+	SourceID string `json:"sourceID,omitempty"`
+	Count    int    `json:"count"`
+	ReadOnly bool   `json:"readOnly"`
 }
 
 // parseISO8601 parses an ISO 8601 date string from the bridge.
@@ -137,9 +134,7 @@ func convertRawReminder(r *rawReminder) Reminder {
 		ModifiedAt:     parseOptionalTime(r.ModifiedAt),
 		Priority:       Priority(r.Priority),
 		Completed:      r.Completed,
-		Flagged:        r.Flagged,
 		URL:            derefString(r.URL),
-		Tags:           append([]string(nil), r.Tags...),
 		Recurring:      r.Recurring,
 		HasAlarms:      r.HasAlarms,
 	}
@@ -240,15 +235,13 @@ func parseListsJSON(jsonStr string) ([]List, error) {
 	result := make([]List, len(raw))
 	for i, r := range raw {
 		result[i] = List{
-			ID:          r.ID,
-			Title:       r.Title,
-			Color:       r.Color,
-			Source:      r.Source,
-			Count:       r.Count,
-			ReadOnly:    r.ReadOnly,
-			IsShared:    r.IsShared,
-			SharedToMe:  r.SharedToMe,
-			IsOwnedByMe: r.IsOwnedByMe,
+			ID:       r.ID,
+			Title:    r.Title,
+			Color:    r.Color,
+			Source:   r.Source,
+			SourceID: r.SourceID,
+			Count:    r.Count,
+			ReadOnly: r.ReadOnly,
 		}
 	}
 	return result, nil
@@ -257,16 +250,21 @@ func parseListsJSON(jsonStr string) ([]List, error) {
 // --- JSON marshaling for list writes ---
 
 type createListJSON struct {
-	Title  string `json:"title"`
-	Source string `json:"source,omitempty"`
-	Color  string `json:"color,omitempty"`
+	Title    string `json:"title"`
+	Source   string `json:"source,omitempty"`
+	SourceID string `json:"sourceID,omitempty"`
+	Color    string `json:"color,omitempty"`
 }
 
 func marshalCreateListInput(input CreateListInput) (string, error) {
+	if err := validate.Container(input.Title, input.Source, input.SourceID, input.Color); err != nil {
+		return "", err
+	}
 	j := createListJSON{
-		Title:  input.Title,
-		Source: input.Source,
-		Color:  input.Color,
+		Title:    input.Title,
+		Source:   input.Source,
+		SourceID: input.SourceID,
+		Color:    input.Color,
 	}
 	data, err := json.Marshal(j)
 	if err != nil {
@@ -276,6 +274,16 @@ func marshalCreateListInput(input CreateListInput) (string, error) {
 }
 
 func marshalUpdateListInput(input UpdateListInput) (string, error) {
+	if input.Title != nil {
+		if err := validate.ID(*input.Title); err != nil {
+			return "", err
+		}
+	}
+	if input.Color != nil {
+		if err := validate.Color(*input.Color); err != nil {
+			return "", err
+		}
+	}
 	m := make(map[string]any)
 	if input.Title != nil {
 		m["title"] = *input.Title
@@ -292,6 +300,9 @@ func marshalUpdateListInput(input UpdateListInput) (string, error) {
 
 // marshalCreateInput converts CreateReminderInput to JSON for the bridge.
 func marshalCreateInput(input CreateReminderInput) (string, error) {
+	if err := validateCreate(input); err != nil {
+		return "", err
+	}
 	m := map[string]any{
 		"title": input.Title,
 	}
@@ -299,18 +310,16 @@ func marshalCreateInput(input CreateReminderInput) (string, error) {
 	if input.Notes != "" {
 		m["notes"] = input.Notes
 	}
+	if input.ListID != "" {
+		m["listID"] = input.ListID
+	}
 	if input.ListName != "" {
 		m["listName"] = input.ListName
 	}
 	if input.URL != "" {
 		m["url"] = input.URL
 	}
-	if input.Flagged {
-		m["flagged"] = true
-	}
-	if len(input.Tags) > 0 {
-		m["tags"] = input.Tags
-	}
+
 	if input.Priority != PriorityNone {
 		m["priority"] = int(input.Priority)
 	}
@@ -371,6 +380,9 @@ func marshalAlarms(alarms []Alarm) []map[string]any {
 // marshalUpdateInput converts UpdateReminderInput to JSON for the bridge.
 // Only non-nil fields are included.
 func marshalUpdateInput(input UpdateReminderInput) (string, error) {
+	if err := validateUpdate(input); err != nil {
+		return "", err
+	}
 	m := map[string]any{}
 
 	if input.Title != nil {
@@ -378,6 +390,9 @@ func marshalUpdateInput(input UpdateReminderInput) (string, error) {
 	}
 	if input.Notes != nil {
 		m["notes"] = *input.Notes
+	}
+	if input.ListID != nil {
+		m["listID"] = *input.ListID
 	}
 	if input.ListName != nil {
 		m["listName"] = *input.ListName
@@ -390,12 +405,6 @@ func marshalUpdateInput(input UpdateReminderInput) (string, error) {
 	}
 	if input.Completed != nil {
 		m["completed"] = *input.Completed
-	}
-	if input.Flagged != nil {
-		m["flagged"] = *input.Flagged
-	}
-	if input.Tags != nil {
-		m["tags"] = *input.Tags
 	}
 
 	if input.ClearDueDate {

@@ -21,10 +21,7 @@ var urlCandidatePattern = regexp.MustCompile(`(?i)\bhttps?://[^\s<>"']+`)
 // bare domains like "zoom.us/j/123" are intentionally ignored to avoid false
 // positives in prose.
 //
-// This is the pure-Go fallback behind [Event.ConferenceURL]: when the private
-// EventKit accessor is unavailable (or returns nothing), the field is
-// populated by running this detector over the event's URL, location, and
-// notes.
+// Event.ConferenceURL uses this detector on the public URL, location and notes.
 func DetectConferenceURL(texts ...string) string {
 	for _, text := range texts {
 		if text == "" {

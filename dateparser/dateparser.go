@@ -86,6 +86,9 @@ func ParseDateRelativeTo(input string, now time.Time, opts ...Option) (time.Time
 	}
 
 	cfg := buildConfig(opts)
+	if cfg.defaultHour < 0 || cfg.defaultHour > 23 {
+		return time.Time{}, fmt.Errorf("default hour must be 0–23")
+	}
 
 	// Try standard formats first
 	if t, err := tryStandardFormats(input, now.Location()); err == nil {
@@ -219,14 +222,17 @@ func parseRelative(input string, now time.Time) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("not a relative date")
 	}
 
-	amount, _ := strconv.Atoi(matches[1])
+	amount, err := strconv.Atoi(matches[1])
+	if err != nil || amount > 1000000 {
+		return time.Time{}, fmt.Errorf("relative amount out of range")
+	}
 	unit := matches[2]
 
 	switch {
 	case strings.HasPrefix(unit, "min"):
-		return now.Add(time.Duration(amount) * time.Minute), nil
+		return addDuration(now, amount, time.Minute)
 	case strings.HasPrefix(unit, "hour"), strings.HasPrefix(unit, "hr"):
-		return now.Add(time.Duration(amount) * time.Hour), nil
+		return addDuration(now, amount, time.Hour)
 	case strings.HasPrefix(unit, "day"):
 		return now.AddDate(0, 0, amount), nil
 	case strings.HasPrefix(unit, "week"):
@@ -247,14 +253,17 @@ func parseAgo(input string, now time.Time) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("not an ago date")
 	}
 
-	amount, _ := strconv.Atoi(matches[1])
+	amount, err := strconv.Atoi(matches[1])
+	if err != nil || amount > 1000000 {
+		return time.Time{}, fmt.Errorf("relative amount out of range")
+	}
 	unit := matches[2]
 
 	switch {
 	case strings.HasPrefix(unit, "min"):
-		return now.Add(-time.Duration(amount) * time.Minute), nil
+		return addDuration(now, -amount, time.Minute)
 	case strings.HasPrefix(unit, "hour"), strings.HasPrefix(unit, "hr"):
-		return now.Add(-time.Duration(amount) * time.Hour), nil
+		return addDuration(now, -amount, time.Hour)
 	case strings.HasPrefix(unit, "day"):
 		return now.AddDate(0, 0, -amount), nil
 	case strings.HasPrefix(unit, "week"):
@@ -296,12 +305,16 @@ func parseNextWeekday(input string, now time.Time, cfg config) (time.Time, error
 		timeStr := strings.Join(parts[3:], " ")
 		if hour, min, err := parseTimeStr(timeStr); err == nil {
 			result = todayAt(result, hour, min)
+		} else {
+			return time.Time{}, err
 		}
 	} else if len(parts) >= 3 {
 		// "next monday 2pm"
 		timeStr := strings.Join(parts[2:], " ")
 		if hour, min, err := parseTimeStr(timeStr); err == nil {
 			result = todayAt(result, hour, min)
+		} else {
+			return time.Time{}, err
 		}
 	}
 
@@ -451,6 +464,8 @@ func buildMonthDayResult(mon time.Month, day int, rest string, now time.Time, cf
 		timeStr := strings.TrimPrefix(rest, "at ")
 		if h, min, err := parseTimeStr(timeStr); err == nil {
 			result = time.Date(y, mon, day, h, min, 0, 0, now.Location())
+		} else {
+			return time.Time{}, err
 		}
 	}
 
@@ -534,6 +549,9 @@ func parseTimeStr(s string) (int, int, error) {
 }
 
 func convertTo24(hour, min int, period string) (int, int, error) {
+	if min < 0 || min > 59 {
+		return 0, 0, fmt.Errorf("invalid minute: %d", min)
+	}
 	if hour < 1 || hour > 12 {
 		return 0, 0, fmt.Errorf("invalid hour: %d", hour)
 	}
@@ -547,6 +565,14 @@ func convertTo24(hour, min int, period string) (int, int, error) {
 		}
 	}
 	return hour, min, nil
+}
+
+func addDuration(now time.Time, n int, unit time.Duration) (time.Time, error) {
+	const maxDuration = int64(1<<63 - 1)
+	if int64(n) > maxDuration/int64(unit) || int64(n) < -maxDuration/int64(unit) {
+		return time.Time{}, fmt.Errorf("relative duration overflow")
+	}
+	return now.Add(time.Duration(n) * unit), nil
 }
 
 func todayAt(base time.Time, hour, min int) time.Time {

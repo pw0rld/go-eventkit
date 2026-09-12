@@ -55,7 +55,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/pw0rld/go-eventkit"
+	"github.com/pw0rld/macos-agenda"
 )
 
 // Client provides access to macOS Reminders via EventKit.

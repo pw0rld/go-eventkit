@@ -2,10 +2,16 @@ package calendar
 
 import (
 	"fmt"
-	"github.com/pw0rld/go-eventkit"
-	"github.com/pw0rld/go-eventkit/internal/validate"
+	"github.com/pw0rld/macos-agenda"
+	"github.com/pw0rld/macos-agenda/internal/validate"
 	"time"
 )
+
+// Validate checks a create request without requesting macOS access.
+func (in CreateEventInput) Validate() error { return validateCreate(in) }
+
+// Validate checks an update payload; effective dates are also checked against the stored event on save.
+func (in UpdateEventInput) Validate() error { return validateUpdate(in) }
 
 func validateSpan(s Span) error {
 	if s != SpanThisEvent && s != SpanFutureEvents {

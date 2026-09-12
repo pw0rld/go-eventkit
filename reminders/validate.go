@@ -2,9 +2,15 @@ package reminders
 
 import (
 	"fmt"
-	"github.com/pw0rld/go-eventkit/internal/validate"
+	"github.com/pw0rld/macos-agenda/internal/validate"
 	"time"
 )
+
+// Validate checks a create request without requesting macOS access.
+func (in CreateReminderInput) Validate() error { return validateCreate(in) }
+
+// Validate checks an update payload without requesting macOS access.
+func (in UpdateReminderInput) Validate() error { return validateUpdate(in) }
 
 func validateQuery(o *listOptions) error {
 	if o.listIDSet && o.listNameSet {

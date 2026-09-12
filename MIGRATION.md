@@ -1,6 +1,8 @@
 # Migration from upstream v0.15.0
 
-The module path is now `github.com/pw0rld/go-eventkit`. Update import paths and your module requirement together. Pin a reviewed fork commit or a future fork release; do not assume existing upstream tags contain these changes.
+The project has been renamed from `pw0rld/go-eventkit` to `pw0rld/macos-agenda`. Update existing fork imports and Git remotes to the new name. The root Go package remains named `eventkit` for the underlying framework types. The executable is `agenda`; build with `make build` to include macOS privacy metadata.
+
+The module path is now `github.com/pw0rld/macos-agenda`. Update import paths and your module requirement together. Pin a reviewed fork commit or a future fork release; do not assume existing upstream tags contain these changes.
 
 | Previous API/behavior | Maintained fork |
 |---|---|

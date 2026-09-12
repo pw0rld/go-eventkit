@@ -49,7 +49,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/pw0rld/go-eventkit"
+	"github.com/pw0rld/macos-agenda"
 )
 
 // Sentinel errors returned by Client methods. Use [errors.Is] to check:

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/pw0rld/go-eventkit"
-	"github.com/pw0rld/go-eventkit/internal/validate"
+	"github.com/pw0rld/macos-agenda"
+	"github.com/pw0rld/macos-agenda/internal/validate"
 )
 
 // rawEvent is the intermediate JSON representation from the ObjC bridge.

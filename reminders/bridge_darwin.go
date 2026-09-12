@@ -12,7 +12,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
-	"github.com/pw0rld/go-eventkit/internal/validate"
+	"github.com/pw0rld/macos-agenda/internal/validate"
 	"strings"
 	"sync"
 	"unsafe"

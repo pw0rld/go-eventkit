@@ -2,7 +2,7 @@ package calendar
 
 import (
 	"encoding/json"
-	"github.com/pw0rld/go-eventkit"
+	"github.com/pw0rld/macos-agenda"
 	"math"
 	"testing"
 	"time"

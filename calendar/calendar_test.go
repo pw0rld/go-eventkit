@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pw0rld/go-eventkit"
+	"github.com/pw0rld/macos-agenda"
 )
 
 // --- Enum String() tests ---

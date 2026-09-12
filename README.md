@@ -1,9 +1,58 @@
-# go-eventkit
+# macos-agenda
 
-A small macOS Calendar and Reminders library maintained at `github.com/pw0rld/go-eventkit`.
+A macOS Calendar and Reminders CLI (`agenda`) and Go library maintained at `github.com/pw0rld/macos-agenda`.
 It uses Go + cgo + Apple's **public EventKit APIs**. No private frameworks, shell commands, telemetry, direct network clients, or third-party Go modules are used by the library.
 
-This fork intentionally makes breaking API changes from upstream v0.15.0. See [MIGRATION.md](MIGRATION.md).
+This independently maintained project makes breaking API changes from upstream go-eventkit v0.15.0. See [MIGRATION.md](MIGRATION.md).
+
+## Build and run the CLI
+
+```sh
+make build
+./.build/agenda --help
+./.build/agenda status
+```
+
+The binary is `.build/agenda`, built for the current Mac architecture. The build embeds an Info.plist with Calendar/Reminders usage descriptions and applies a local ad-hoc signature. Keep the binary at a stable path. This is a local build, not a notarized release. Use `make build` rather than plain `go install` so the privacy metadata is included.
+
+`status` only checks permissions; it does not prompt or read calendar content. To grant access, run these from the terminal application you intend to use and respond to macOS's dialogs:
+
+```sh
+./.build/agenda authorize calendar
+./.build/agenda authorize reminders
+./.build/agenda calendars
+./.build/agenda lists
+```
+
+Authorization may be attributed to the launching app. A Terminal grant does not necessarily grant a different agent host access. The CLI pumps the main run loop while EventKit executes on a worker, allowing normal system callbacks.
+
+Queries return JSON:
+
+```sh
+./.build/agenda events list --from 2026-09-14T00:00:00+08:00 --to 2026-09-21T00:00:00+08:00
+./.build/agenda reminders list --completed false
+```
+
+For writes, use a JSON file or `--input -` for stdin. Preview the supplied examples without accessing either store:
+
+```sh
+./.build/agenda events create --input examples/event.json --dry-run
+./.build/agenda reminders create --input examples/reminder.json --dry-run
+```
+
+Replace the example's `calendarID`/`listID` with the exact ID from `calendars`/`lists`, adjust the dates, then omit `--dry-run` to save. Dry run validates the payload only; it does not establish that the target exists or is writable. Unlike the library's optional default destination, **CLI creation requires an explicit container ID**.
+
+```sh
+./.build/agenda reminders update --id COMPLETE_ID --input update.json
+./.build/agenda reminders complete --id COMPLETE_ID
+./.build/agenda reminders delete --id COMPLETE_ID --confirm-id COMPLETE_ID
+```
+
+An update JSON such as `{"notes":""}` clears notes while leaving other fields untouched. `null` means omitted for pointer fields; use empty strings to clear text, `clearDueDate: true` to remove a reminder due date, and `alarms: []` to clear alarms. Empty updates, unknown/duplicate fields, inputs over 1 MiB and nesting over 128 levels are rejected. All date/time fields use RFC3339 with explicit UTC offsets. Advanced duration fields such as `alerts[].relativeOffset` follow Go's JSON representation in nanoseconds; `-900000000000` means 15 minutes before. Recurrence input follows the library types below.
+
+Deletion requires matching `--id` and `--confirm-id`; it is not an interactive confirmation. Resolve and review the target with `get` before deleting. Event update/delete accepts `--span this|future` (default `this`). CLI container operations are limited to listing; container creation/deletion remains a library API.
+
+Success JSON goes to stdout, error JSON to stderr. Exit codes: 0 success, 64 invalid request, 2 denied EventKit access, 1 other failures. Do not blindly retry a create after an uncertain system/provider error.
 
 ## Supported scope
 
@@ -24,12 +73,12 @@ Not included: native reminder tags/flags, private sharing metadata, private URL 
 - Go 1.24.5+ and Apple Command Line Tools to build. No full Xcode installation is required.
 - Calendar and/or Reminders privacy access for the application launching the binary.
 
-For local development, clone this fork and use a Go module `replace` directive pointing to the checkout. Until a fork release is published, pin a reviewed **fork commit**, rather than using an upstream tag or `@latest`.
+For local development, clone this repository and use a Go module `replace` directive pointing to the checkout. Until a release is published, pin a reviewed **macos-agenda commit**, rather than using an upstream tag or `@latest`.
 
 ```go
 import (
-    "github.com/pw0rld/go-eventkit/calendar"
-    "github.com/pw0rld/go-eventkit/reminders"
+    "github.com/pw0rld/macos-agenda/calendar"
+    "github.com/pw0rld/macos-agenda/reminders"
 )
 ```
 

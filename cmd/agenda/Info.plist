@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.pw0rld.macos-agenda</string>
+<key>CFBundleName</key><string>macos-agenda</string>
+<key>CFBundleExecutable</key><string>agenda</string>
+<key>NSCalendarsFullAccessUsageDescription</key><string>Read and manage the calendar events you request from agenda.</string>
+<key>NSRemindersFullAccessUsageDescription</key><string>Read and manage the reminders you request from agenda.</string>
+<key>NSCalendarsUsageDescription</key><string>Read and manage requested calendar events.</string>
+<key>NSRemindersUsageDescription</key><string>Read and manage requested reminders.</string>
+</dict></plist>
